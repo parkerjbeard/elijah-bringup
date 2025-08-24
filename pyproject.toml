@@ -1,0 +1,128 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elijahctl"
+version = "1.0.0"
+description = "CLI tool for automated drone provisioning and verification"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Elijah Team", email = "team@elijah.com"}
+]
+dependencies = [
+    "click>=8.1.0",
+    "requests>=2.31.0",
+    "paramiko>=3.3.0",
+    "pymavlink>=2.4.41",
+    "pyyaml>=6.0.1",
+    "rich>=13.5.0",
+    "telnetlib3>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "cryptography>=41.0.0",
+    "aiohttp>=3.8.0",
+    "pydantic>=2.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-mock>=3.11.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.7.0",
+    "mypy>=1.5.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+elijahctl = "elijahctl.cli:main"
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+include = '\.pyi?$'
+
+[tool.ruff]
+line-length = 100
+select = [
+    "E",
+    "F",
+    "W",
+    "C90",
+    "I",
+    "N",
+    "UP",
+    "B",
+    "A",
+    "C4",
+    "ISC",
+    "ICN",
+    "PIE",
+    "PT",
+    "RET",
+    "SIM",
+    "TID",
+    "TCH",
+    "ARG",
+    "PTH",
+    "ERA",
+    "PGH",
+    "PL",
+    "TRY",
+    "NPY",
+    "RUF"
+]
+ignore = [
+    "E501",
+    "B008",
+    "B905",
+    "C901",
+    "PLR0913",
+]
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_any_generics = false
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = [
+    "elijahctl/tests",
+]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.coverage.run]
+source = ["elijahctl"]
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    "*/site-packages/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if __name__ == .__main__.:",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if False:",
+    "if TYPE_CHECKING:",
+]
