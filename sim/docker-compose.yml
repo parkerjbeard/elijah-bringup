@@ -1,0 +1,72 @@
+version: "3.9"
+
+networks:
+  elijah-simnet:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+services:
+  microhard_air:
+    build: ./services/microhard_sim
+    container_name: microhard_air
+    environment:
+      ROLE: "air"
+      STATE_PATH: /sim/state.json
+      MAC: "00:11:22:33:44:55"
+      IP: "172.28.0.10"
+      LEASES_FILE: /leases/leases.json
+    networks:
+      elijah-simnet:
+        ipv4_address: 172.28.0.10
+    volumes:
+      - ./services/microhard_sim/state_air.json:/sim/state.json
+      - ./services/leases/leases.json:/leases/leases.json
+
+  microhard_ground:
+    build: ./services/microhard_sim
+    container_name: microhard_ground
+    environment:
+      ROLE: "ground"
+      STATE_PATH: /sim/state.json
+      MAC: "00:11:22:33:44:66"
+      IP: "172.28.0.11"
+      LEASES_FILE: /leases/leases.json
+    networks:
+      elijah-simnet:
+        ipv4_address: 172.28.0.11
+    volumes:
+      - ./services/microhard_sim/state_ground.json:/sim/state.json
+      - ./services/leases/leases.json:/leases/leases.json
+
+  jetson:
+    build: ./services/jetson_sim
+    container_name: jetson_sim
+    environment:
+      STATE_PATH: /sim/state.json
+    networks:
+      elijah-simnet:
+        ipv4_address: 172.28.0.20
+    volumes:
+      - ./services/jetson_sim/state.json:/sim/state.json
+
+  unifi:
+    build: ./services/unifi_sim
+    container_name: unifi_sim
+    networks:
+      elijah-simnet:
+        ipv4_address: 172.28.0.30
+
+  mavlink:
+    build: ./services/mavlink_sim
+    container_name: mavlink_sim
+    network_mode: host
+
+  udp_emitters:
+    build: ./services/udp_emitters
+    container_name: udp_emitters
+    network_mode: host
+    environment:
+      RADIO_STATS_ENABLED: "1"
+      VIDEO_ENABLED: "1"
+      VIDEO_PORT: "5600"

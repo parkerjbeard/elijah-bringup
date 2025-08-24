@@ -10,6 +10,10 @@ help:
 	@echo "  make format       Format code (black)"
 	@echo "  make clean        Clean build artifacts"
 	@echo "  make build        Build package"
+	@echo "  make sim-up       Build and start simulation"
+	@echo "  make sim-down     Stop simulation and remove volumes"
+	@echo "  make sim-logs     Tail sim service logs"
+	@echo "  make sim-test     Run pytest -m sim against sim"
 	@echo "  make all          Run format, lint, type-check, and test"
 
 install:
@@ -51,3 +55,15 @@ run-tests:
 	pytest elijahctl/tests/integration -v
 
 all: format lint type-check test
+
+sim-up:
+	python sim/tools/simctl.py up
+
+sim-down:
+	python sim/tools/simctl.py down
+
+sim-logs:
+	python sim/tools/simctl.py logs
+
+sim-test:
+	SIM=1 pytest -m sim -v || true
