@@ -42,37 +42,39 @@ class MicrohardDriver:
         self._stats_params: Dict[str, Any] = {}
         
     def _detect_profile_via_http(self) -> Optional[MHProfile]:
-        """Best-effort Microhard profile detection over HTTP using LuCI RPC.
+        """Detect Microhard UCI profile over HTTP using ubus with auth.
 
-        Tries to fetch the `mh_radio` config with `uci.get_all`. If present, we
-        assume the placeholder mapping (until a live map is confirmed).
+        Uses ubus session login and a uci get (or get_all) to confirm the
+        presence of mh_radio, then returns our placeholder mapping.
         """
         try:
-            url = f"http://{self.ip}/cgi-bin/luci/rpc/uci"
-            payload = {"id": 1, "method": "get_all", "params": ["mh_radio"]}
-            r = requests.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
-            if r.ok:
-                j = r.json()
-                if j:
-                    # Presence is enough to select our placeholder mapping
-                    return MHProfile(
-                        name="mh_radio_v1",
-                        uci_keys={
-                            # Semantic -> (config, section, option)
-                            "role": ("mh_radio", "@mh[0]", "mode"),
-                            "freq_mhz": ("mh_radio", "@mh[0]", "freq_mhz"),
-                            "bw_mhz": ("mh_radio", "@mh[0]", "bw_mhz"),
-                            "net_id": ("mh_radio", "@mh[0]", "net_id"),
-                            "aes_key": ("mh_radio", "@mh[0]", "aes_key"),
-                            # Network keys (when switching to DHCP client)
-                            "dhcp_proto": ("network", "lan", "proto"),
-                            # Radio stats block (if present on the build)
-                            "stats_enable": ("mh_stats", "@stats[0]", "enable"),
-                            "stats_port": ("mh_stats", "@stats[0]", "port"),
-                            "stats_interval": ("mh_stats", "@stats[0]", "interval"),
-                            "stats_fields": ("mh_stats", "@stats[0]", "fields"),
-                        },
-                    )
+            if not self.session_token:
+                self.session_token = self._ubus_login()
+            if not self.session_token:
+                return None
+            j = self._ubus_call("uci", "get", {"config": "mh_radio"})
+            if j:
+                return MHProfile(
+                    name="mh_radio_v1",
+                    uci_keys={
+                        # Semantic -> (config, section, option)
+                        "role": ("mh_radio", "@mh[0]", "mode"),
+                        "freq_mhz": ("mh_radio", "@mh[0]", "freq_mhz"),
+                        "bw_mhz": ("mh_radio", "@mh[0]", "bw_mhz"),
+                        "net_id": ("mh_radio", "@mh[0]", "net_id"),
+                        "aes_key": ("mh_radio", "@mh[0]", "aes_key"),
+                        # New mappings: TX power and encryption switch
+                        "tx_power": ("mh_radio", "@mh[0]", "tx_power"),
+                        "encrypt_enable": ("mh_radio", "@mh[0]", "encrypt"),
+                        # Network keys (when switching to DHCP client)
+                        "dhcp_proto": ("network", "lan", "proto"),
+                        # Radio stats block (if present on the build)
+                        "stats_enable": ("mh_stats", "@stats[0]", "enable"),
+                        "stats_port": ("mh_stats", "@stats[0]", "port"),
+                        "stats_interval": ("mh_stats", "@stats[0]", "interval"),
+                        "stats_fields": ("mh_stats", "@stats[0]", "fields"),
+                    },
+                )
         except Exception as e:
             logger.debug(f"HTTP profile detect failed: {e}")
         return None
@@ -141,28 +143,55 @@ class MicrohardDriver:
             return False, str(e)
     
     def _ubus_login(self) -> Optional[str]:
+        """Authenticate to the device, preferring LuCI RPC then falling back to raw ubus."""
+        # First try LuCI RPC auth proxy
         try:
             url = f"http://{self.ip}/cgi-bin/luci/rpc/auth"
             payload = {"id": 1, "method": "login", "params": [self.username, self.password]}
             response = requests.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
-            response.raise_for_status()
-            j = response.json()
-            # Guard on error payloads
-            if isinstance(j, dict) and "error" in j:
-                logger.error(f"ubus login error: {j['error']}")
-                return None
-            token: Optional[str] = None
-            # Accept both list-wrapped and flat shapes
-            if isinstance(j.get("result"), list) and len(j["result"]) > 1:
-                token = j["result"][1].get("ubus_rpc_session")
-            if not token:
-                token = j.get("ubus_rpc_session")
-            if token:
-                logger.debug(f"Got ubus session token: {token[:8]}...")
-            return token
+            if response.ok:
+                j = response.json()
+                if isinstance(j, dict) and "result" in j:
+                    res = j.get("result")
+                    # Some builds: [0, {ubus_rpc_session: ...}]
+                    if isinstance(res, list) and len(res) > 1 and isinstance(res[1], dict):
+                        token = res[1].get("ubus_rpc_session")
+                        if token:
+                            return token
+                    # Others: flat dict
+                    token = j.get("ubus_rpc_session")
+                    if token:
+                        return token
+        except Exception:
+            pass
+        # Fallback: raw ubus session login
+        try:
+            url = f"http://{self.ip}/ubus"
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "call",
+                "params": [
+                    "00000000000000000000000000000000",
+                    "session",
+                    "login",
+                    {"username": self.username, "password": self.password},
+                ],
+            }
+            response = requests.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
+            if response.ok:
+                j = response.json()
+                res = j.get("result")
+                if isinstance(res, list) and len(res) > 1:
+                    code = res[0]
+                    data = res[1] if isinstance(res[1], dict) else {}
+                    token = data.get("ubus_rpc_session")
+                    if code == 0 and token:
+                        logger.debug(f"Got ubus session token: {token[:8]}...")
+                        return token
         except Exception as e:
             logger.error(f"ubus login failed: {e}")
-            return None
+        return None
     
     def _ubus_call(self, service: str, method: str, params: Dict[str, Any]) -> Optional[Dict]:
         if not self.session_token:
@@ -170,26 +199,39 @@ class MicrohardDriver:
             if not self.session_token:
                 return None
         
-        try:
-            url = f"http://{self.ip}/ubus"
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "call",
-                "params": [self.session_token, service, method, params]
-            }
-            
-            response = requests.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
-            response.raise_for_status()
-            j = response.json()
-            if isinstance(j, dict) and "error" in j:
-                logger.error(f"ubus error: {j['error']}")
+        def do_call(token: str) -> Optional[Dict]:
+            try:
+                url = f"http://{self.ip}/ubus"
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "call",
+                    "params": [token, service, method, params],
+                }
+                response = requests.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
+                if not response.ok:
+                    return None
+                j = response.json()
+                # Handle top-level error or non-zero result code
+                if isinstance(j, dict):
+                    if "error" in j:
+                        return None
+                    res = j.get("result")
+                    if isinstance(res, list) and len(res) > 0 and isinstance(res[0], int) and res[0] != 0:
+                        return None
+                return j
+            except Exception:
                 return None
+
+        # First attempt
+        j = do_call(self.session_token)
+        if j is not None:
             return j
-            
-        except Exception as e:
-            logger.error(f"ubus call failed: {e}")
+        # Retry once after re-login (possible expired session)
+        self.session_token = self._ubus_login()
+        if not self.session_token:
             return None
+        return do_call(self.session_token)
     
     def _stage_system_config(self, config: RadioConfig):
         self.staged_config['system'] = {
@@ -202,12 +244,15 @@ class MicrohardDriver:
     
     def _stage_radio_params(self, config: RadioConfig):
         # Stage semantic radio params; mapping to UCI happens during apply via profile
+        encrypt_enable = "1" if str(config.encryption).lower().startswith("aes") else "0"
         self._radio_params = {
             'role': config.mode,
             'freq_mhz': int(config.frequency),
             'bw_mhz': int(config.bandwidth),
             'net_id': config.net_id,
             'aes_key': config.aes_key,
+            'tx_power': int(config.tx_power),
+            'encrypt_enable': encrypt_enable,
         }
         logger.debug(
             f"Staged radio params: role={config.mode}, freq={config.frequency}, bw={config.bandwidth}, net={config.net_id}"
@@ -325,6 +370,8 @@ class MicrohardDriver:
                 'bw_mhz': self._radio_params.get('bw_mhz'),
                 'net_id': self._radio_params.get('net_id'),
                 'aes_key': self._radio_params.get('aes_key'),
+                'tx_power': self._radio_params.get('tx_power'),
+                'encrypt_enable': self._radio_params.get('encrypt_enable'),
             }):
                 return False
         if self._stats_params:
@@ -384,6 +431,8 @@ class MicrohardDriver:
                 'bw_mhz': self._radio_params.get('bw_mhz'),
                 'net_id': self._radio_params.get('net_id'),
                 'aes_key': self._radio_params.get('aes_key'),
+                'tx_power': self._radio_params.get('tx_power'),
+                'encrypt_enable': self._radio_params.get('encrypt_enable'),
             }):
                 return False
         if self._stats_params:

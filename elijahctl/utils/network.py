@@ -7,6 +7,8 @@ from typing import Optional, Dict, List, Tuple
 import shutil
 from pathlib import Path
 import platform
+import os
+import json
 
 def port_open(host: str, port: int, timeout: float = 2.0) -> bool:
     try:
@@ -56,13 +58,32 @@ def ping_host(host: str, count: int = 3, timeout: int = 2) -> Tuple[bool, Option
     return (ok, (sum(rtts) / len(rtts)) if rtts else None)
 
 def _parse_arp_cache(mac_lower: str) -> Optional[str]:
+    """Parse ARP cache using available tools.
+
+    Prefer `arp -an` when present, else fall back to `ip neigh` on Linux.
+    """
+    # First try `arp -an`
     try:
-        result = subprocess.run(["arp", "-an"], capture_output=True, text=True)
-        pattern = r"\(([0-9.]+)\)\s+at\s+([0-9a-f:]{17})"
-        for match in re.finditer(pattern, result.stdout, re.IGNORECASE):
-            ip, mac = match.groups()
-            if mac.lower() == mac_lower:
-                return ip
+        if shutil.which("arp"):
+            result = subprocess.run(["arp", "-an"], capture_output=True, text=True)
+            pattern = r"\(([0-9.]+)\)\s+at\s+([0-9a-f:]{17})"
+            for match in re.finditer(pattern, result.stdout, re.IGNORECASE):
+                ip, mac = match.groups()
+                if mac.lower() == mac_lower:
+                    return ip
+    except Exception:
+        pass
+    # Fallback: `ip neigh`
+    try:
+        if shutil.which("ip"):
+            result = subprocess.run(["ip", "neigh"], capture_output=True, text=True)
+            # Format: 192.168.1.1 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE
+            for line in result.stdout.splitlines():
+                m = re.search(r"^(\d+\.\d+\.\d+\.\d+)\s+.*lladdr\s+([0-9a-f:]{17})", line, re.IGNORECASE)
+                if m:
+                    ip, mac = m.groups()
+                    if mac.lower() == mac_lower:
+                        return ip
     except Exception:
         pass
     return None
@@ -70,10 +91,9 @@ def _parse_arp_cache(mac_lower: str) -> Optional[str]:
 
 def _iter_hosts_limited(network: ipaddress.IPv4Network, seed_ip: Optional[ipaddress.IPv4Address] = None):
     """Yield host IPs to probe. For /24, yield all hosts. For larger nets, only seed /24."""
-    # For large networks, constrain to the /24 containing seed_ip (if provided)
+    # For large networks, constrain to the /24 that contains seed_ip (if provided)
     if network.prefixlen <= 16 and seed_ip and seed_ip in network:
-        third = int(str(seed_ip).split(".")[2])
-        constrained = ipaddress.ip_network(f"{network.network_address.exploded.split('.')[0]}.{network.network_address.exploded.split('.')[1]}.{third}.0/24")
+        constrained = ipaddress.ip_network(f"{seed_ip}/24", strict=False)
         for h in constrained.hosts():
             yield h
         return
@@ -138,10 +158,24 @@ def _local_networks() -> List[ipaddress.IPv4Interface]:
 
 def find_mac_in_leases(mac_address: str, subnet: Optional[str] = None) -> Optional[str]:
     """
-    Try to discover an IP for the given MAC by warming the ARP cache via a short ping sweep,
-    then reading the ARP table. Optionally constrain to a CIDR.
+    Deterministic lookup when ELIJAH_SIM_LEASES_FILE is set, else fall back to
+    local ARP warm + parse. Optionally constrain to a CIDR for the ARP warm.
     """
     mac_lower = mac_address.lower()
+
+    # Simulation shim: use a file mapping MAC -> IP when provided
+    try:
+        sim_path = os.environ.get("ELIJAH_SIM_LEASES_FILE")
+        if sim_path:
+            p = Path(sim_path)
+            if p.exists():
+                mapping = json.loads(p.read_text())
+                ip = mapping.get(mac_lower) or mapping.get(mac_lower.upper())
+                if ip:
+                    return ip
+    except Exception:
+        # Fall through to ARP-based discovery
+        pass
 
     # First quick pass: check existing ARP cache
     try:
@@ -194,6 +228,12 @@ def find_mac_in_leases(mac_address: str, subnet: Optional[str] = None) -> Option
         except Exception:
             continue
 
+    # Allow a brief moment for ARP cache population after probes
+    try:
+        time.sleep(0.25)
+    except Exception:
+        pass
+
     # Read ARP cache again
     return _parse_arp_cache(mac_lower)
 
@@ -207,6 +247,10 @@ def scan_network_for_device(mac_prefix: Optional[str] = None,
         for ip in network.hosts():
             ip_str = str(ip)
             if port_open(ip_str, 80, timeout=0.5) or port_open(ip_str, 22, timeout=0.5):
+                if mac_prefix:
+                    mac = (get_mac_address(ip_str) or "").lower()
+                    if not mac.startswith(mac_prefix.lower()):
+                        continue
                 devices.append({"ip": ip_str, "reachable": True})
     except:
         pass
@@ -214,24 +258,43 @@ def scan_network_for_device(mac_prefix: Optional[str] = None,
     return devices
 
 def get_mac_address(ip: str) -> Optional[str]:
+    """Return MAC for a given IP using ARP or `ip neigh`.
+
+    Works even when `arp` (net-tools) is missing by falling back to `ip neigh`.
+    """
+    # Warm ARP via UDP packet to a discard-like port
     try:
-        # Warm ARP via UDP packet to discard port
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(0.2)
-            sock.sendto(b"\x00", (ip, 9))
-            sock.close()
-        except Exception:
-            pass
-        result = subprocess.run(["arp", "-n", ip], capture_output=True, text=True)
-        
-        mac_match = re.search(r"([0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2})", 
-                              result.stdout, re.IGNORECASE)
-        if mac_match:
-            return mac_match.group(1)
-    except:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.2)
+        sock.sendto(b"\x00", (ip, 9))
+        sock.close()
+    except Exception:
         pass
-    
+
+    # Try `arp -n <ip>` first when available
+    try:
+        if shutil.which("arp"):
+            result = subprocess.run(["arp", "-n", ip], capture_output=True, text=True)
+            mac_match = re.search(
+                r"([0-9a-f]{2}(:[0-9a-f]{2}){5})",
+                result.stdout,
+                re.IGNORECASE,
+            )
+            if mac_match:
+                return mac_match.group(1)
+    except Exception:
+        pass
+
+    # Fallback: `ip neigh show to <ip>`
+    try:
+        if shutil.which("ip"):
+            result = subprocess.run(["ip", "neigh", "show", "to", ip], capture_output=True, text=True)
+            m = re.search(r"lladdr\s+([0-9a-f:]{17})", result.stdout, re.IGNORECASE)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+
     return None
 
 def wait_for_host(host: str, port: int = 22, timeout: int = 60, interval: int = 2) -> bool:

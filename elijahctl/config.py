@@ -47,7 +47,7 @@ class RadioConfig:
 @dataclass
 class JetsonConfig:
     drone_id: str
-    device_name: str
+    device_name: str = ""
     sysid: int
     ansible_host: str = "192.168.55.1"
     ansible_user: str = "jetson"
@@ -55,7 +55,8 @@ class JetsonConfig:
     microhard_password: str = ""
     
     def __post_init__(self):
-        self.device_name = f"el-{self.drone_id}"
+        if not self.device_name:
+            self.device_name = f"el-{self.drone_id}"
 
 @dataclass
 class UniFiConfig:
@@ -68,6 +69,7 @@ class UniFiConfig:
     netmask: str = "16"
     disable_24ghz: bool = True
     disable_autolink: bool = True
+    verify_tls: bool = False
 
 @dataclass
 class HitlChecklist:
@@ -160,7 +162,7 @@ class Config:
     DEFAULT_MICROHARD_PASS = "admin"
     
     SSH_TIMEOUT = 10
-    HTTP_TIMEOUT = 5
+    HTTP_TIMEOUT = 10
     TELNET_TIMEOUT = 5
     MAVLINK_TIMEOUT = 10
     HEALTH_CHECK_TIMEOUT = 5

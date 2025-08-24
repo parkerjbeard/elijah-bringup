@@ -17,7 +17,7 @@ class UniFiDriver:
     def __init__(self, config: UniFiConfig):
         self.config = config
         self.session = requests.Session()
-        self.session.verify = False
+        self.session.verify = bool(config.verify_tls)
         self.csrf_token = None
         self.site_name = config.site
         self.api_version = None
@@ -174,16 +174,25 @@ class UniFiDriver:
             except Exception:
                 pass
 
+            # Accept CIDR length or dotted mask in config.netmask
+            try:
+                mask = str(ipaddress.IPv4Network(f"0.0.0.0/{self.config.netmask}", strict=False).netmask)
+            except Exception:
+                mask = "255.255.255.0"
+
+            net_obj = {
+                "type": "static",
+                "ip": self.config.static_ip,
+                "netmask": mask,
+                "gateway": gateway_ip,
+                "dns1": "8.8.8.8",
+                "dns2": "8.8.4.4",
+            }
+            # Include both keys to straddle controller version differences
             config_data = {
                 "name": self.config.device_name,
-                "config_network": {
-                    "type": "static",
-                    "ip": self.config.static_ip,
-                    "netmask": f"255.255.0.0" if self.config.netmask == "16" else "255.255.255.0",
-                    "gateway": gateway_ip,
-                    "dns1": "8.8.8.8",
-                    "dns2": "8.8.4.4"
-                }
+                "config_network": net_obj,
+                "config_networks": net_obj,
             }
             
             response = self.session.put(url, json=config_data, timeout=Config.HTTP_TIMEOUT)
@@ -215,20 +224,17 @@ class UniFiDriver:
             for wlan in wlans:
                 wlan_id = wlan.get("_id")
                 wlan_name = wlan.get("name")
-                
                 if not wlan_id:
                     continue
-                
+                # Mutate only band keys in-place to avoid losing other fields
+                updated = dict(wlan)
+                # Controllers vary: some use 'wlan_bands' (list), others 'wlan_band' (string)
+                if "wlan_bands" in updated:
+                    updated["wlan_bands"] = ["5g"]
+                if "wlan_band" in updated:
+                    updated["wlan_band"] = "5g"
                 update_url = f"{self._net_base()}/api/s/{self.site_name}/rest/wlanconf/{wlan_id}"
-                update_data = {
-                    "enabled": wlan.get("enabled", True),
-                    "name": wlan_name,
-                    "wlan_band": "5g",
-                    "wlan_bands": ["5g"]
-                }
-                
-                update_response = self.session.put(update_url, json=update_data, timeout=Config.HTTP_TIMEOUT)
-                
+                update_response = self.session.put(update_url, json=updated, timeout=Config.HTTP_TIMEOUT)
                 if update_response.status_code == 200:
                     success(f"Disabled 2.4 GHz on network: {wlan_name}")
                 else:

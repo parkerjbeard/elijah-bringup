@@ -1,18 +1,16 @@
 import socket
 import json
 import time
-import subprocess
 import logging
 from typing import Dict, List, Optional, Tuple, Any
 from urllib.parse import urlparse
 from datetime import datetime
 import paramiko
 import os
-import requests
 
 from ..config import Config, HealthCheckResult
 from ..drivers.mavlink import MAVLinkDriver
-from ..utils.network import ping_host, port_open
+from ..utils.network import ping_host
 from ..utils.logging import get_logger, info, success, error, warning, create_progress
 
 logger = get_logger(__name__)
@@ -81,8 +79,8 @@ class HealthCheck:
     def check_tailscale(self) -> HealthCheckResult:
         info("Checking Tailscale status")
         
+        client = paramiko.SSHClient()
         try:
-            client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(
                 self.jetson_host,
@@ -95,7 +93,6 @@ class HealthCheck:
             
             stdin, stdout, stderr = client.exec_command("tailscale status --json")
             output = stdout.read().decode('utf-8')
-            client.close()
             
             if output:
                 status = json.loads(output)
@@ -118,6 +115,11 @@ class HealthCheck:
             
         except Exception as e:
             logger.error(f"Tailscale check failed: {e}")
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
         
         return self._add_result(
             "Tailscale",
@@ -222,11 +224,11 @@ class HealthCheck:
                 except Exception:
                     port = 5600
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind(("0.0.0.0", port))
-                sock.settimeout(5)
                 try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind(("0.0.0.0", port))
+                    sock.settimeout(5)
                     data, addr = sock.recvfrom(4096)
-                    sock.close()
                     if data:
                         return self._add_result(
                             "Video Stream",
@@ -235,12 +237,16 @@ class HealthCheck:
                             {"transport": "udp", "port": port, "bytes_received": len(data)}
                         )
                 except socket.timeout:
-                    sock.close()
                     return self._add_result(
                         "Video Stream",
                         False,
                         f"UDP {port}: no packets received"
                     )
+                finally:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
             # RTSP mode: rtsp://host[:port]/...
             elif spec.startswith("rtsp://"):
                 url = urlparse(spec)
@@ -254,22 +260,28 @@ class HealthCheck:
                         req = f"OPTIONS {spec} RTSP/1.0\r\nCSeq: 1\r\n\r\n".encode()
                         s.sendall(req)
                         s.settimeout(3)
-                        data = s.recv(512)
+                        data = s.recv(1024)
                         s.close()
-                        if data:
+                        text = data.decode(errors="ignore") if data else ""
+                        if "RTSP/1.0" in text or "Public:" in text or "OPTIONS" in text:
                             return self._add_result(
                                 "Video Stream",
                                 True,
                                 f"RTSP {host}:{port}: responsive",
                                 {"transport": "rtsp", "host": host, "port": port}
                             )
+                        else:
+                            return self._add_result(
+                                "Video Stream",
+                                False,
+                                f"RTSP {host}:{port}: unexpected response",
+                            )
                     except Exception:
                         s.close()
                         return self._add_result(
                             "Video Stream",
-                            True,
-                            f"RTSP {host}:{port}: TCP open",
-                            {"transport": "rtsp", "host": host, "port": port}
+                            False,
+                            f"RTSP {host}:{port}: no RTSP response",
                         )
                 else:
                     return self._add_result(
@@ -414,6 +426,10 @@ class HealthCheck:
     
     def run_all_checks(self) -> List[HealthCheckResult]:
         info("Running comprehensive health checks")
+        try:
+            Config.init_directories()
+        except Exception:
+            pass
         self.results = []
         
         with create_progress() as progress:

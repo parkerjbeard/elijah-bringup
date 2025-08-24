@@ -49,6 +49,9 @@ def detect_profile(uci_show_text: str) -> Optional[MHProfile]:
                 "bw_mhz": ("mh_radio", "@mh[0]", "bw_mhz"),
                 "net_id": ("mh_radio", "@mh[0]", "net_id"),
                 "aes_key": ("mh_radio", "@mh[0]", "aes_key"),
+                # New mappings: TX power and encryption switch
+                "tx_power": ("mh_radio", "@mh[0]", "tx_power"),
+                "encrypt_enable": ("mh_radio", "@mh[0]", "encrypt"),
                 # Network keys (when switching to DHCP client)
                 "dhcp_proto": ("network", "lan", "proto"),
                 # Radio stats block (if present on the build)
