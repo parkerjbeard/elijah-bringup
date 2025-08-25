@@ -396,9 +396,16 @@ class MicrohardDriver:
                                 return False, buf
                             if "OK" in buf:
                                 return True, buf
+                            # Special handling for AT&W command success
+                            if cmd.strip().upper() == "AT&W" and "restarting" in buf.lower():
+                                return True, buf
                     else:
                         # Small sleep to avoid busy loop
                         time.sleep(0.05)
+                
+                # If the channel is no longer active after sending AT&W, consider it a success
+                if cmd.strip().upper() == "AT&W" and not chan.active:
+                    return True, buf
                 # Timed out waiting for an explicit OK/ERROR
                 return False, buf
 

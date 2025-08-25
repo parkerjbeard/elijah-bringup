@@ -128,14 +128,14 @@ def provision(role: str, drone_id: Optional[str], sysid: Optional[int],
 @cli.command()
 @click.option('--ip', default=Config.DEFAULT_MICROHARD_IP, help='Radio IP address')
 @click.option('--user', default='admin', help='Radio username')
-@click.option('--password', default='admin', help='Radio password')
+@click.option('--microhard-pass', default='admin', help='Radio password')
 @click.option('--force', is_flag=True, help='Do not prompt for confirmation')
-def reset_radio(ip: str, user: str, password: str, force: bool):
+def reset_radio(ip: str, user: str, microhard_pass: str, force: bool):
     if not force and not confirm(f"This will reset the radio at {ip}. Continue?"):
         info("Reset cancelled")
         return
     
-    driver = MicrohardDriver(ip, user, password)
+    driver = MicrohardDriver(ip, user, microhard_pass)
     if driver.safe_reset():
         success("Radio reset successfully")
     else:
