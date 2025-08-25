@@ -159,7 +159,8 @@ class Config:
     
     DEFAULT_MICROHARD_IP = "192.168.168.1"
     DEFAULT_MICROHARD_USER = "admin"
-    DEFAULT_MICROHARD_PASS = "supercool"
+    DEFAULT_MICROHARD_PASS = "admin"  # Factory default password
+    TARGET_MICROHARD_PASS = "supercool"  # Password we set during provisioning
     
     SSH_TIMEOUT = 10
     HTTP_TIMEOUT = 10

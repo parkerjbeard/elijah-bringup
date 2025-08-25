@@ -3,6 +3,7 @@ import click
 import json
 import sys
 import os
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -54,20 +55,30 @@ def radio_profile(ip: str):
 
 @cli.command()
 @click.option('--role', type=click.Choice(['air', 'ground']), required=True, help='Radio role')
-@click.option('--drone-id', required=True, help='Drone ID (e.g., 012)')
+@click.option('--drone-id', help='Drone ID (e.g., 012)')
 @click.option('--sysid', type=int, help='MAV_SYS_ID (required for air role)')
 @click.option('--aes-key', envvar='AES_KEY', required=True, help='AES-128 encryption key')
-@click.option('--microhard-pass', envvar='MICROHARD_PASS', default='supercool', help='Microhard admin password')
+@click.option('--microhard-pass', envvar='MICROHARD_PASS', default='admin', help='Current Microhard admin password (default: admin for factory)')
 @click.option('--tailscale-key', envvar='TAILSCALE_KEY', help='Tailscale auth key (for air role)')
 @click.option('--ip', default=Config.DEFAULT_MICROHARD_IP, help='Radio IP address')
 @click.option('--yes', is_flag=True, help='Run without interactive prompts')
-def provision(role: str, drone_id: str, sysid: Optional[int], 
+def provision(role: str, drone_id: Optional[str], sysid: Optional[int], 
              aes_key: str, microhard_pass: str, 
              tailscale_key: Optional[str], ip: str, yes: bool):
     
+    # Prompt for drone ID if not provided
+    if not drone_id:
+        drone_id = click.prompt('Enter drone ID (e.g., 012)', type=str)
+        if not drone_id:
+            error("Drone ID is required")
+            sys.exit(1)
+    
+    # Prompt for sysid if air role and not provided
     if role == 'air' and not sysid:
-        error("--sysid is required for air radio provisioning")
-        sys.exit(1)
+        sysid = click.prompt('Enter MAV_SYS_ID for air radio', type=int)
+        if not sysid:
+            error("--sysid is required for air radio provisioning")
+            sys.exit(1)
     
     radio_config = RadioConfig(
         role=RadioRole.AIR if role == 'air' else RadioRole.GROUND,
@@ -76,6 +87,11 @@ def provision(role: str, drone_id: str, sysid: Optional[int],
         description="",
         aes_key=aes_key
     )
+    
+    # Add debug logging for password
+    logger = logging.getLogger(__name__)
+    logger.debug(f"Creating MicrohardDriver with IP={ip}, user={Config.DEFAULT_MICROHARD_USER}, pass={'*' * len(microhard_pass) if microhard_pass else 'None'}")
+    logger.debug(f"Password provided: '{microhard_pass}', length={len(microhard_pass) if microhard_pass else 0}")
     
     driver = MicrohardDriver(ip, Config.DEFAULT_MICROHARD_USER, microhard_pass)
     
@@ -106,7 +122,7 @@ def provision(role: str, drone_id: str, sysid: Optional[int],
 @cli.command()
 @click.option('--ip', default=Config.DEFAULT_MICROHARD_IP, help='Radio IP address')
 @click.option('--user', default='admin', help='Radio username')
-@click.option('--password', default='supercool', help='Radio password')
+@click.option('--password', default='admin', help='Radio password')
 @click.option('--force', is_flag=True, help='Do not prompt for confirmation')
 def reset_radio(ip: str, user: str, password: str, force: bool):
     if not force and not confirm(f"This will reset the radio at {ip}. Continue?"):

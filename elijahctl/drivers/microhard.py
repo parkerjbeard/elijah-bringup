@@ -10,7 +10,11 @@ import telnetlib3
 from dataclasses import dataclass
 import requests
 import paramiko
+import urllib3
 from requests.exceptions import RequestException, Timeout
+
+# Disable SSL warnings for self-signed certificates
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from ..config import RadioConfig, RadioRole, Config
 from .mh_profile import MHProfile, detect_profile
@@ -167,6 +171,7 @@ class MicrohardDriver:
     def _ssh_execute(self, command: str, *, try_exec_first: bool = True) -> Tuple[bool, str]:
         try:
             logger.debug(f"SSH connecting to {self.ip} as {self.username} with password: {'*' * len(self.password)}")
+            logger.debug(f"SSH Credentials - user: '{self.username}', pass_len: {len(self.password)}, pass_value: '{self.password}'")
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(
@@ -268,6 +273,11 @@ class MicrohardDriver:
         except paramiko.AuthenticationException as e:
             logger.error(f"SSH authentication failed for {self.username}@{self.ip}: {e}")
             logger.debug(f"Attempted credentials - username: {self.username}, password length: {len(self.password)}")
+            logger.debug(f"Password value (for debugging): '{self.password}'")
+            logger.debug("Common issues:")
+            logger.debug("  1. Check if password is correct (default: 'admin')")
+            logger.debug("  2. Verify username is 'admin'")
+            logger.debug("  3. Ensure radio is at factory defaults or password hasn't been changed")
             return False, f"Authentication failed: {e}"
         except paramiko.SSHException as e:
             logger.error(f"SSH error: {e}")
@@ -281,12 +291,16 @@ class MicrohardDriver:
     
     def _ubus_login(self) -> Optional[str]:
         """Authenticate to the device, preferring LuCI RPC then falling back to raw ubus."""
+        # Create session with SSL verification disabled for weak/self-signed certificates
+        session = requests.Session()
+        session.verify = False
+        
         # First try LuCI RPC auth proxy
         try:
             url = f"http://{self.ip}/cgi-bin/luci/rpc/auth"
             payload = {"id": 1, "method": "login", "params": [self.username, self.password]}
             logger.debug(f"HTTP POST {url} payload={_mask_dict(payload)}")
-            response = requests.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
+            response = session.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
             if response.ok:
                 j = response.json()
                 logger.debug(f"HTTP auth proxy response: {_mask_dict(j)}")
@@ -318,7 +332,7 @@ class MicrohardDriver:
                 ],
             }
             logger.debug(f"HTTP POST {url} payload={_mask_dict(payload)}")
-            response = requests.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
+            response = session.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
             if response.ok:
                 j = response.json()
                 logger.debug(f"ubus login response: {_mask_dict(j)}")
@@ -340,6 +354,10 @@ class MicrohardDriver:
             if not self.session_token:
                 return None
         
+        # Create session with SSL verification disabled
+        session = requests.Session()
+        session.verify = False
+        
         def do_call(token: str) -> Optional[Dict]:
             try:
                 url = f"http://{self.ip}/ubus"
@@ -350,7 +368,7 @@ class MicrohardDriver:
                     "params": [token, service, method, params],
                 }
                 logger.debug(f"ubus call {service}.{method} params={_mask_dict(params)}")
-                response = requests.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
+                response = session.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
                 if not response.ok:
                     logger.debug(f"ubus call HTTP status {response.status_code}")
                     return None
@@ -536,6 +554,11 @@ class MicrohardDriver:
         test_success, test_output = self._ssh_execute("echo test")
         if not test_success:
             error(f"SSH connection test failed: {test_output}")
+            if "Authentication failed" in test_output:
+                logger.error("SSH authentication failed. Please verify:")
+                logger.error("  - The radio password (use --microhard-pass or set MICROHARD_PASS env var)")
+                logger.error("  - Default password is 'admin' if radio is at factory settings")
+                logger.error("  - If password was changed, provide the correct password")
             return False
         logger.debug(f"SSH test successful: {test_output.strip()}")
         
@@ -667,7 +690,13 @@ class MicrohardDriver:
         
         if prefer_ssh and connection.ssh_available:
             result = self.apply_via_ssh()
+            if not result and connection.http_available:
+                warning("SSH failed, attempting HTTP/ubus fallback")
+                result = self.apply_via_http()
+                if result:
+                    success("Configuration applied via HTTP fallback")
         elif connection.http_available:
+            info("Using HTTP/ubus for configuration")
             result = self.apply_via_http()
         else:
             error("No suitable connection method available")
@@ -876,10 +905,50 @@ class MicrohardDriver:
             error(f"Safe reset failed: {e!r}")
             return False
     
+    def change_password(self, new_password: str) -> bool:
+        """Change the device password to the target password."""
+        info(f"Changing device password")
+        logger.debug(f"Changing password from current to: {'*' * len(new_password)}")
+        
+        # Use echo to pipe password to passwd command (BusyBox style)
+        # Note: Different systems may need different approaches
+        cmd = f"(echo '{new_password}'; echo '{new_password}') | passwd"
+        success_flag, output = self._ssh_execute(cmd)
+        
+        if success_flag and ("password updated successfully" in output.lower() or 
+                             "password changed" in output.lower() or
+                             len(output.strip()) == 0):  # Sometimes no output means success
+            success("Password changed successfully")
+            self.password = new_password  # Update the driver's password
+            return True
+        
+        # Try alternative method
+        logger.debug("First password change method didn't work, trying alternative")
+        cmd = f"echo -e '{new_password}\\n{new_password}' | passwd"
+        success_flag, output = self._ssh_execute(cmd)
+        
+        if success_flag and ("password updated successfully" in output.lower() or 
+                             "password changed" in output.lower() or
+                             len(output.strip()) == 0):
+            success("Password changed successfully (alternative method)")
+            self.password = new_password
+            return True
+        
+        warning(f"Could not change password via SSH. Output: {output[:200]}")
+        return False
+    
     def provision(self, config: RadioConfig) -> bool:
         try:
             connection = self.discover()
             info(f"Provisioning {config.role.value} radio: {config.hostname}")
+            
+            # If we're using factory default password, change it to target password
+            if self.password == Config.DEFAULT_MICROHARD_PASS and Config.TARGET_MICROHARD_PASS != Config.DEFAULT_MICROHARD_PASS:
+                info("Detected factory default password, changing to deployment password")
+                if self.change_password(Config.TARGET_MICROHARD_PASS):
+                    success("Password updated to deployment standard")
+                else:
+                    warning("Could not change password, continuing with factory default")
             
             self.stage_config(config)
             
