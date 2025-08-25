@@ -100,7 +100,7 @@ elijahctl version
   - `logs/` – execution logs
 
 Defaults (`elijahctl/config.py`):
-- Microhard: IP `192.168.168.1`, user `admin`, pass `admin`
+- Microhard: IP `192.168.168.1`, user `admin`, pass `supercool`
 - Jetson: host `192.168.55.1`, user `jetson`
 - UniFi: site `default`, device `rainmakerGCSX`, static `10.101.252.1/16`
 

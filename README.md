@@ -24,21 +24,30 @@ For detailed setup procedures, refer to the [Production Setup Guide](setup.md).
 
 ### Installation Methods
 
-#### Source Installation
+#### Source Installation (recommended with venv)
 
 ```bash
 # Clone repository
 git clone https://github.com/elijah/elijahctl.git
 cd elijahctl
 
-# Production installation
-pip install .
+# Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 
-# Development installation
+# Install the package (editable for development, or drop -e for production)
+pip install -e .
+
+# For development tooling (tests, linting, etc.)
 pip install -e ".[dev]"
 ```
 
-#### Recommended: pipx Installation
+Notes:
+- Activate the environment in each new terminal before running commands: `source .venv/bin/activate`.
+- If you prefer not to activate, you can call the CLI directly: `./.venv/bin/elijahctl ...`.
+
+#### Optional: pipx Installation
 
 ```bash
 pipx install elijahctl
@@ -46,10 +55,18 @@ pipx install elijahctl
 
 ## Quick Reference
 
+Before running commands, activate your venv:
+
+```bash
+source /Users/parkerbeard/elijah-bringup/.venv/bin/activate
+```
+
 ### 1. Service Discovery
 
 ```bash
 elijahctl discover --ip 192.168.168.1
+# or without activating the venv
+/Users/parkerbeard/elijah-bringup/.venv/bin/elijahctl discover --ip 192.168.168.1
 ```
 
 ### 2. Air Unit Provisioning
@@ -123,7 +140,7 @@ elijahctl checklist \
 
 ```bash
 export AES_KEY="your-128-bit-aes-key"
-export MICROHARD_PASS="admin-or-fleet-password"
+export MICROHARD_PASS="supercool"
 export TAILSCALE_KEY="tskey-auth-..."
 ```
 
@@ -199,6 +216,14 @@ Certain operations require manual intervention by design:
 4. **RemoteID Setup**: Module configuration and regulatory database registration
 
 ## Troubleshooting
+### Command not found / wrong interpreter
+1. Ensure the venv is activated: `source .venv/bin/activate`
+2. Or call the tool via absolute path: `./.venv/bin/elijahctl ...`
+3. Verify installation completed without errors: `pip install -e .`
+
+### Device offline
+- If the Microhard radio is powered off or disconnected, `discover` will report all services as False. This is expected and confirms the CLI is working.
+
 
 ### Radio Communication Issues
 1. Power cycle radio and switch simultaneously

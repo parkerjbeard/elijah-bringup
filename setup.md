@@ -2,7 +2,7 @@
 
 **Hardware Requirements**
 
-* Air Microhard radio with 4 antennas
+* Air Microhard pMDDL2450/pDDL2450 radio with 4 antennas
   (inner MMCX→SMA lead **remains permanently attached**; outer SMA↔SMA connects to paddle).
 * Jetson companion (USB Gadget enabled at `192.168.55.1`), FC connected/powered, PTH sensors, camera.
 * Ground station: either a configured **ground Microhard** or an **adopted UniFi AP**.
@@ -23,7 +23,7 @@ sudo apt-get -y install ansible  # Ubuntu/Debian or brew install ansible on macO
 
 ```bash
 export AES_KEY="your-128-bit-aes-key"
-export MICROHARD_PASS="admin-or-fleet-pass"
+export MICROHARD_PASS="supercool"  # Default password for newer firmware
 export TAILSCALE_KEY="tskey-auth-..."
 ```
 
@@ -31,6 +31,30 @@ export TAILSCALE_KEY="tskey-auth-..."
 
 * `drone_id=012` → Jetson hostname: `el-012`, air radio hostname: `elijah-012-air`
 * `sysid=12`
+
+**Network Architecture**
+
+```
+┌─────────────────────────────────────────┐
+│ Air Unit Network Topology               │
+├─────────────────────────────────────────┤
+│ Radio (Air/Slave):  192.168.168.1       │
+│ ├── Jetson:         192.168.55.1        │
+│ │   ├── mavlink-router: :14550          │
+│ │   ├── radio-stats:    :22222          │
+│ │   ├── seraph:         :8080           │
+│ │   └── elijah:         :9090           │
+│ └── Flight Controller: via Serial       │
+└─────────────────────────────────────────┘
+
+┌─────────────────────────────────────────┐
+│ Ground Station Network Topology         │
+├─────────────────────────────────────────┤
+│ Radio (Ground/Master): 192.168.168.1    │
+│ ├── GCS Computer:      DHCP Client      │
+│ └── UniFi AP:          10.101.252.1/16  │
+└─────────────────────────────────────────┘
+```
 
 ---
 
@@ -302,17 +326,159 @@ elijahctl checklist --update /tmp/hitl.json --drone-id 012 --phase hitl -v
 
 ---
 
-## 10) Troubleshooting Guide
+## 10) Service Dependencies and Management
 
-* **No services at 192.168.168.1** → Power‑cycle **radio and switch simultaneously**; re‑run `discover`.
-* **Radio unreachable post-configuration** → Use `--radio-ip auto` (MAC-based discovery) or check DHCP leases; verify physical connectivity.
-* **Missing radio statistics** → Verify statistics enabled on radio, UDP port 22222 accessible; run `elijahctl health -v` for diagnostic output.
-* **No MAVLink heartbeats** → Verify `mavlink-router` service and FC power; re‑execute `set-sysid`.
-* **UniFi configuration drift** → Apply required settings via UI; re‑run `elijahctl unifi` for validation.
+### Service Architecture
+```mermaid
+graph TD
+    A[System Boot] --> B[Network Stack]
+    B --> C[mavlink-router]
+    B --> D[radio-stats]
+    C --> E[seraph]
+    C --> F[elijah]
+    D --> E
+    E --> G[Flight Stack Ready]
+    F --> G
+```
+
+### Service Descriptions
+
+| Service | Purpose | Dependencies | Port | Start Order |
+|---------|---------|--------------|------|-------------|
+| **mavlink-router** | Routes MAVLink messages between FC and GCS | Serial port, network | UDP 14550 | 1st |
+| **radio-stats** | Collects and publishes radio telemetry | Radio network interface | UDP 22222 | 2nd |
+| **seraph** | High-level vehicle control and monitoring | mavlink-router, radio-stats | HTTP 8080 | 3rd |
+| **elijah** | Mission management and autonomy | mavlink-router, seraph | HTTP 9090 | 4th |
+
+### Service Management Commands
+```bash
+# Check all services
+ssh jetson@192.168.55.1
+systemctl status mavlink-router seraph elijah radio-stats
+
+# Correct startup order
+sudo systemctl start mavlink-router && sleep 2
+sudo systemctl start radio-stats && sleep 1
+sudo systemctl start seraph && sleep 1
+sudo systemctl start elijah
+
+# View service logs
+journalctl -u mavlink-router -f
+```
 
 ---
 
-## 11) Optional: ESC Configuration
+## 11) UCI Profile Detection
+
+The system automatically detects and maps Microhard firmware profiles to UCI configuration paths.
+
+### How It Works
+1. System runs `uci show` to gather configuration
+2. Searches for known patterns (e.g., `mh_radio.*`)
+3. Maps semantic keys to UCI paths
+4. Falls back to custom profiles if defined
+
+### Custom Profile Definition
+Create `~/.elijahctl/state/mh_profile.json` for non-standard firmware:
+```json
+{
+  "name": "custom_mh_v2",
+  "uci_keys": {
+    "hostname": ["system", "@system[0]", "hostname"],
+    "role": ["mh_radio", "@mh[0]", "mode"],
+    "freq_mhz": ["mh_radio", "@mh[0]", "freq_mhz"],
+    "tx_power": ["mh_radio", "@mh[0]", "tx_power"],
+    "aes_key": ["mh_radio", "@mh[0]", "aes_key"]
+  }
+}
+```
+
+---
+
+## 12) Troubleshooting Guide
+
+### Common Issues
+
+#### No Services at 192.168.168.1
+* Power‑cycle **both radio and switch simultaneously**
+* Re‑run: `elijahctl discover --ip 192.168.168.1 -v`
+* Check link: `ethtool eth0` (should show "Link detected: yes")
+
+#### Radio Unreachable Post-Configuration
+* Use MAC-based discovery: `elijahctl health --radio-ip auto`
+* Check DHCP leases: `cat /var/lib/dhcp/dhcpd.leases`
+* Manual scan: `sudo arp-scan --local | grep -i microhard`
+
+#### Service Dependency Failures
+```bash
+# Check dependencies
+systemctl list-dependencies mavlink-router
+
+# Reset services
+sudo systemctl daemon-reload
+sudo systemctl reset-failed
+
+# Manual start in order
+for service in mavlink-router radio-stats seraph elijah; do
+  sudo systemctl start $service
+  sleep 2
+  systemctl is-active $service || break
+done
+```
+
+#### No MAVLink Heartbeats
+* Check mavlink-router: `systemctl status mavlink-router`
+* Test serial: `sudo screen /dev/ttyTHS0 57600`
+* Re-run: `elijahctl set-sysid --host el-012 --sysid 12 -v`
+
+#### UCI Configuration Not Applied
+```bash
+# Force commit
+ssh admin@192.168.168.1
+uci commit && sync && reboot
+
+# Check filesystem
+df -h  # Ensure not full
+```
+
+### Advanced Diagnostics
+```bash
+# Real-time radio stats
+nc -u -l 22222 | jq '.'
+
+# Service logs
+ssh jetson@192.168.55.1 "journalctl -u mavlink-router -u seraph --since '1 hour ago'"
+
+# MAVLink capture
+sudo tcpdump -i any -w mavlink.pcap 'udp port 14550'
+```
+
+---
+
+## 13) Firmware Compatibility
+
+### Tested Versions
+| Component | Version | Status |
+|-----------|---------|--------|
+| **Microhard pMDDL2450** | | |
+| Firmware 1.0.7.1 | 2023-06-15 | ✅ Stable, recommended |
+| Firmware 1.0.8.0 | 2023-09-20 | ⚠️ Beta, enhanced stats |
+| Firmware 1.0.6.x | 2023-03-01 | ⚠️ Legacy, limited support |
+| **Jetson** | | |
+| JetPack 5.1.2 | L4T 35.4.1 | ✅ Recommended |
+| JetPack 5.1.1 | L4T 35.3.1 | ✅ Supported |
+| **PX4** | | |
+| PX4 1.14.0 | 2023-07-01 | ✅ Recommended |
+| PX4 1.13.3 | 2023-03-01 | ⚠️ Minimum |
+
+### Known Issues
+* Radio FW < 1.0.6: Missing UCI support
+* JetPack 5.0.x: Network driver issues
+* PX4 < 1.13.0: MAVLink v2 issues
+
+---
+
+## 14) Optional: ESC Configuration
 
 For ESC validation:
 
@@ -327,7 +493,7 @@ For ESC validation:
 
 ---
 
-## 12) Required Documentation per Unit
+## 15) Required Documentation per Unit
 
 * `~/.elijahctl/state/runs/*.json` from health and checklist operations.
 * `~/.elijahctl/inventory/checklist.csv` entry.

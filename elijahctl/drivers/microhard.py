@@ -1,8 +1,12 @@
 import time
+import shlex
 import json
-import telnetlib
 import logging
+import asyncio
+import contextlib
+import socket
 from typing import Optional, Dict, Any, Tuple
+import telnetlib3
 from dataclasses import dataclass
 import requests
 import paramiko
@@ -17,6 +21,45 @@ from ..utils.network import (
 from ..utils.logging import get_logger, info, success, error, warning
 
 logger = get_logger(__name__)
+
+_SENSITIVE_KEYS = ("password", "pass", "key", "secret", "token", "ubus_rpc_session", "aes")
+
+def _mask_value(v: Any) -> Any:
+    if isinstance(v, str):
+        if not v:
+            return v
+        if len(v) <= 4:
+            return "****"
+        return v[:2] + "***" + v[-2:]
+    return v
+
+def _mask_dict(obj: Any) -> Any:
+    try:
+        if isinstance(obj, dict):
+            masked = {}
+            for k, v in obj.items():
+                if any(s in str(k).lower() for s in _SENSITIVE_KEYS):
+                    masked[k] = _mask_value(v)
+                else:
+                    masked[k] = _mask_dict(v)
+            return masked
+        if isinstance(obj, list):
+            return [_mask_dict(v) for v in obj]
+    except Exception:
+        pass
+    return obj
+
+def _mask_cmd(cmd: str) -> str:
+    try:
+        s = cmd.strip()
+        if s.startswith("uci set ") and "=" in s:
+            left, right = s.split("=", 1)
+            option = left.split(".")[-1].strip().lower()
+            if any(t in option for t in _SENSITIVE_KEYS):
+                return left + "=******"
+        return cmd
+    except Exception:
+        return cmd
 
 @dataclass
 class MicrohardConnection:
@@ -52,8 +95,10 @@ class MicrohardDriver:
                 self.session_token = self._ubus_login()
             if not self.session_token:
                 return None
-            j = self._ubus_call("uci", "get", {"config": "mh_radio"})
+            logger.debug("Attempting HTTP profile detect via uci.get_all mh_radio")
+            j = self._ubus_call("uci", "get_all", {"config": "mh_radio"})
             if j:
+                logger.debug("HTTP profile detect succeeded; using mh_radio_v1 placeholder mapping")
                 return MHProfile(
                     name="mh_radio_v1",
                     uci_keys={
@@ -108,14 +153,20 @@ class MicrohardDriver:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with open(path, 'w') as f:
                     f.write(mac.strip())
+                try:
+                    import os
+                    os.chmod(path, 0o600)
+                except Exception:
+                    pass
         except Exception:
             pass
         
         info(f"Found services - SSH: {services['ssh']}, HTTP: {services['http']}, Telnet: {services['telnet']}")
         return connection
     
-    def _ssh_execute(self, command: str) -> Tuple[bool, str]:
+    def _ssh_execute(self, command: str, *, try_exec_first: bool = True) -> Tuple[bool, str]:
         try:
+            logger.debug(f"SSH connecting to {self.ip} as {self.username} with password: {'*' * len(self.password)}")
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(
@@ -126,18 +177,104 @@ class MicrohardDriver:
                 allow_agent=False,
                 look_for_keys=False
             )
+            # Fast path: try non-interactive exec first (cheap and simple commands)
+            if try_exec_first:
+                try:
+                    logger.debug(f"SSH exec_command: {_mask_cmd(command)}")
+                    stdin, stdout, stderr = client.exec_command(command)
+                    # Paramiko’s stdout is ready when returned; drain with a bounded wait
+                    end_by = time.time() + 10
+                    while not stdout.channel.exit_status_ready() and time.time() < end_by:
+                        time.sleep(0.05)
+                    rc = stdout.channel.recv_exit_status()
+                    out = stdout.read().decode("utf-8", errors="ignore")
+                    err = stderr.read().decode("utf-8", errors="ignore")
+                    if rc == 0 and (out or not err):
+                        client.close()
+                        return True, out.strip()
+                except Exception as e:
+                    logger.debug(f"exec_command path failed, falling back to shell: {e}")
+
+            # Fallback: interactive shell to get out of Microhard CLI into BusyBox
+            logger.debug(f"SSH invoking shell for command: {_mask_cmd(command)}")
+            channel = client.invoke_shell()
+            channel.settimeout(10.0)
             
-            stdin, stdout, stderr = client.exec_command(command)
-            output = stdout.read().decode('utf-8')
-            error_output = stderr.read().decode('utf-8')
+            # Wait for initial prompt and detect if we're in CLI or shell
+            time.sleep(1)
+            initial_output = ""
+            if channel.recv_ready():
+                initial_output = channel.recv(4096).decode('utf-8', errors='ignore')
+                logger.debug(f"Initial prompt: {initial_output[-50:]}")  # Log last 50 chars to see prompt
             
+            # Check if we're in the Microhard CLI (UserDevice> prompt)
+            if "UserDevice>" in initial_output or "ERROR: Invalid command" in initial_output:
+                logger.debug("Detected Microhard CLI, entering Linux shell")
+                # Try common commands to enter shell
+                for shell_cmd in ["sh", "shell", "system", "/bin/sh"]:
+                    channel.send(f"{shell_cmd}\n")
+                    time.sleep(0.5)
+                    if channel.recv_ready():
+                        shell_output = channel.recv(4096).decode('utf-8', errors='ignore')
+                        if "#" in shell_output or "$" in shell_output or "~" in shell_output:
+                            logger.debug(f"Successfully entered shell with '{shell_cmd}'")
+                            break
+                        elif "ERROR" not in shell_output:
+                            # Might have worked but no prompt yet
+                            break
+            
+            # Now execute the actual command inside the shell
+            channel.send(f"{command}\n")
+            time.sleep(1)  # Give command time to execute
+            
+            # Collect output
+            output = ""
+            retries = 0
+            while retries < 5:
+                if channel.recv_ready():
+                    chunk = channel.recv(4096).decode('utf-8', errors='ignore')
+                    output += chunk
+                    retries = 0  # Reset retries if we got data
+                else:
+                    time.sleep(0.2)
+                    retries += 1
+            
+            # Clean up and close
+            channel.send("exit\n")
+            time.sleep(0.2)
+            if "UserDevice>" in output:  # We're back in CLI
+                channel.send("exit\n")  # Exit CLI too
+            channel.close()
             client.close()
             
-            if error_output:
-                logger.warning(f"SSH stderr: {error_output}")
+            # Clean output - remove command echo and prompts
+            lines = output.split('\n')
+            cleaned_lines = []
+            for line in lines:
+                # Skip lines that are just the command echo or prompts
+                if line.strip() == command:
+                    continue
+                if line.strip() in ['#', '$', 'UserDevice>', '']:
+                    continue
+                if "UserDevice>" in line and len(line.strip()) < 20:
+                    continue
+                cleaned_lines.append(line)
             
+            output = '\n'.join(cleaned_lines).strip()
+            
+            logger.debug(f"SSH command completed, output length: {len(output)}")
             return True, output
             
+        except paramiko.AuthenticationException as e:
+            logger.error(f"SSH authentication failed for {self.username}@{self.ip}: {e}")
+            logger.debug(f"Attempted credentials - username: {self.username}, password length: {len(self.password)}")
+            return False, f"Authentication failed: {e}"
+        except paramiko.SSHException as e:
+            logger.error(f"SSH error: {e}")
+            return False, f"SSH error: {e}"
+        except socket.timeout as e:
+            logger.error(f"SSH command timed out: {command}")
+            return False, f"Command timed out: {e}"
         except Exception as e:
             logger.error(f"SSH execution failed: {e}")
             return False, str(e)
@@ -148,9 +285,11 @@ class MicrohardDriver:
         try:
             url = f"http://{self.ip}/cgi-bin/luci/rpc/auth"
             payload = {"id": 1, "method": "login", "params": [self.username, self.password]}
+            logger.debug(f"HTTP POST {url} payload={_mask_dict(payload)}")
             response = requests.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
             if response.ok:
                 j = response.json()
+                logger.debug(f"HTTP auth proxy response: {_mask_dict(j)}")
                 if isinstance(j, dict) and "result" in j:
                     res = j.get("result")
                     # Some builds: [0, {ubus_rpc_session: ...}]
@@ -178,9 +317,11 @@ class MicrohardDriver:
                     {"username": self.username, "password": self.password},
                 ],
             }
+            logger.debug(f"HTTP POST {url} payload={_mask_dict(payload)}")
             response = requests.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
             if response.ok:
                 j = response.json()
+                logger.debug(f"ubus login response: {_mask_dict(j)}")
                 res = j.get("result")
                 if isinstance(res, list) and len(res) > 1:
                     code = res[0]
@@ -208,10 +349,13 @@ class MicrohardDriver:
                     "method": "call",
                     "params": [token, service, method, params],
                 }
+                logger.debug(f"ubus call {service}.{method} params={_mask_dict(params)}")
                 response = requests.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
                 if not response.ok:
+                    logger.debug(f"ubus call HTTP status {response.status_code}")
                     return None
                 j = response.json()
+                logger.debug(f"ubus call response: {_mask_dict(j)}")
                 # Handle top-level error or non-zero result code
                 if isinstance(j, dict):
                     if "error" in j:
@@ -232,6 +376,17 @@ class MicrohardDriver:
         if not self.session_token:
             return None
         return do_call(self.session_token)
+    
+    def _uci_add_http(self, config: str, type_: str) -> Optional[str]:
+        """Add a dynamic section via ubus uci.add and return its section id (e.g., cfg0abc)."""
+        j = self._ubus_call("uci", "add", {"config": config, "type": type_})
+        try:
+            res = j.get("result", []) if isinstance(j, dict) else []
+            if len(res) > 1 and isinstance(res[1], dict):
+                return res[1].get("section")
+        except Exception:
+            pass
+        return None
     
     def _stage_system_config(self, config: RadioConfig):
         self.staged_config['system'] = {
@@ -255,7 +410,7 @@ class MicrohardDriver:
             'encrypt_enable': encrypt_enable,
         }
         logger.debug(
-            f"Staged radio params: role={config.mode}, freq={config.frequency}, bw={config.bandwidth}, net={config.net_id}"
+            f"Staged radio params: role={config.mode}, freq={config.frequency}, bw={config.bandwidth}, net={config.net_id}, tx_power={config.tx_power}, encrypt={encrypt_enable}"
         )
     
     def _stage_network_config(self, config: RadioConfig):
@@ -298,6 +453,7 @@ class MicrohardDriver:
         success(f"Configuration staged for {config.hostname}")
 
     def _detect_profile_via_ssh(self) -> Optional[MHProfile]:
+        logger.debug("Detecting profile via SSH: uci show")
         ok, out = self._ssh_execute("uci show 2>/dev/null || true")
         if ok:
             prof = detect_profile(out)
@@ -314,12 +470,21 @@ class MicrohardDriver:
         if not self.profile:
             error("Cannot apply radio params: unknown Microhard UCI layout")
             return False
+        # Ensure dynamic sections exist when we refer to @stats[0]
+        if any(sk.startswith("stats_") for sk in kv):
+            ok, out = self._ssh_execute(
+                "uci -q show mh_stats | grep -q \"@stats\\[0\\]\" || uci add mh_stats stats && uci commit mh_stats"
+            )
+            if not ok:
+                warning("Could not ensure mh_stats section exists; proceeding anyway")
         # Execute uci set for each mapped key
         for semantic_key, value in kv.items():
             if semantic_key not in self.profile.uci_keys:
                 continue
             cfg, section, option = self.profile.uci_keys[semantic_key]
-            cmd = f"uci set {cfg}.{section}.{option}='{value}'"
+            val = shlex.quote(str(value))
+            cmd = f"uci set {cfg}.{section}.{option}={val}"
+            logger.debug(f"SSH applying mapped set: {_mask_cmd(cmd)}")
             success_flag, output = self._ssh_execute(cmd)
             if not success_flag:
                 error(f"Failed to set {cfg}.{section}.{option}: {output}")
@@ -333,10 +498,25 @@ class MicrohardDriver:
         if not self.profile:
             error("Cannot apply radio params: unknown Microhard UCI layout")
             return False
+        stats_section = "@stats[0]"
+        if any(sk.startswith("stats_") for sk in kv):
+            # Ensure mh_stats section exists; prefer explicit add via ubus
+            logger.debug("Ensuring mh_stats stats section exists (ubus add)")
+            added = self._uci_add_http("mh_stats", "stats") if hasattr(self, "_uci_add_http") else None
+            if added:
+                stats_section = added
+            else:
+                # Last resort: try touching @stats[0] if already present
+                self._ubus_call("uci", "set", {
+                    "config": "mh_stats", "section": stats_section, "values": {"enable": "0"}
+                })
         for semantic_key, value in kv.items():
             if semantic_key not in self.profile.uci_keys:
                 continue
             cfg, section, option = self.profile.uci_keys[semantic_key]
+            if section.startswith("@stats[") and semantic_key.startswith("stats_"):
+                section = stats_section
+            logger.debug(f"HTTP applying mapped set {cfg}.{section}.{option}={_mask_value(str(value))}")
             result = self._ubus_call("uci", "set", {
                 "config": cfg,
                 "section": section,
@@ -349,15 +529,26 @@ class MicrohardDriver:
     
     def apply_via_ssh(self) -> bool:
         info("Applying configuration via SSH")
+        logger.debug(f"Using SSH credentials - username: {self.username}, password: {'*' * len(self.password)}")
+        
+        # First test SSH connectivity with a simple command
+        logger.debug("Testing SSH connectivity with 'echo test' command")
+        test_success, test_output = self._ssh_execute("echo test")
+        if not test_success:
+            error(f"SSH connection test failed: {test_output}")
+            return False
+        logger.debug(f"SSH test successful: {test_output.strip()}")
+        
         # Apply staged generic configs (system/network)
         for config_type, sections in self.staged_config.items():
             for section, values in sections.items():
                 for key, value in values.items():
+                    val = shlex.quote(str(value))
                     if section.startswith('@'):
-                        cmd = f"uci set {config_type}.{section}.{key}='{value}'"
+                        cmd = f"uci set {config_type}.{section}.{key}={val}"
                     else:
-                        cmd = f"uci set {config_type}.{section}.{key}='{value}'"
-                    
+                        cmd = f"uci set {config_type}.{section}.{key}={val}"
+                    logger.debug(f"SSH applying set: {_mask_cmd(cmd)}")
                     success_flag, output = self._ssh_execute(cmd)
                     if not success_flag:
                         error(f"Failed to set {key}: {output}")
@@ -386,6 +577,7 @@ class MicrohardDriver:
         # Commit configs written above
         for config_type in self.staged_config.keys():
             cmd = f"uci commit {config_type}"
+            logger.debug(f"SSH commit: {cmd}")
             success_flag, output = self._ssh_execute(cmd)
             if not success_flag:
                 error(f"Failed to commit {config_type}: {output}")
@@ -394,6 +586,7 @@ class MicrohardDriver:
         if self.profile:
             commit_targets = {cfg for (_, (cfg, _, _)) in self.profile.uci_keys.items()}
             for cfg in commit_targets:
+                logger.debug(f"SSH commit: uci commit {cfg}")
                 success_flag, output = self._ssh_execute(f"uci commit {cfg}")
                 if not success_flag:
                     error(f"Failed to commit {cfg}: {output}")
@@ -414,6 +607,7 @@ class MicrohardDriver:
         # Apply staged generic configs (system/network)
         for config_type, sections in self.staged_config.items():
             for section, values in sections.items():
+                logger.debug(f"HTTP set {config_type}.{section} values={_mask_dict(values)}")
                 result = self._ubus_call("uci", "set", {
                     "config": config_type,
                     "section": section,
@@ -445,6 +639,7 @@ class MicrohardDriver:
                 return False
 
         for config_type in self.staged_config.keys():
+            logger.debug(f"HTTP commit: {config_type}")
             result = self._ubus_call("uci", "commit", {"config": config_type})
             if not result:
                 error(f"Failed to commit {config_type}")
@@ -453,6 +648,7 @@ class MicrohardDriver:
         if self.profile:
             commit_targets = {cfg for (_, (cfg, _, _)) in self.profile.uci_keys.items()}
             for cfg in commit_targets:
+                logger.debug(f"HTTP commit: {cfg}")
                 result = self._ubus_call("uci", "commit", {"config": cfg})
                 if not result:
                     error(f"Failed to commit {cfg}")
@@ -466,6 +662,7 @@ class MicrohardDriver:
             warning("No configuration staged")
             return False
         
+        logger.debug("Beginning apply_config; discovering connection methods")
         connection = self.discover()
         
         if prefer_ssh and connection.ssh_available:
@@ -491,12 +688,14 @@ class MicrohardDriver:
         connection = self.discover()
         
         if connection.ssh_available:
+            logger.debug("Sending reboot via SSH")
             success_flag, output = self._ssh_execute("sync; reboot")
             if success_flag:
                 success("Reboot command sent via SSH")
                 return True
         
         if connection.http_available and self.session_token:
+            logger.debug("Sending reboot via HTTP/ubus")
             result = self._ubus_call("system", "reboot", {})
             if result:
                 success("Reboot command sent via HTTP")
@@ -533,30 +732,95 @@ class MicrohardDriver:
             error("Telnet not available for safe reset")
             return False
         
+        async def _do_telnet_reset(host: str, username: str, password: str) -> None:
+            reader, writer = await asyncio.wait_for(
+                telnetlib3.open_connection(host, 23, encoding="utf8"),
+                timeout=Config.TELNET_TIMEOUT,
+            )
+            try:
+                # Telnet exposes the Microhard CLI (UserDevice>), not a Linux login.
+                # Coax the prompt, then wait for it.
+                info(f"Telnet: session opened to {host}:23; waiting for CLI prompt 'UserDevice>'")
+                writer.write("\r\n"); await writer.drain()
+                logger.debug("Waiting for Microhard CLI prompt")
+                try:
+                    await asyncio.wait_for(reader.readuntil(b"UserDevice>"), timeout=5)
+                except Exception:
+                    await asyncio.sleep(0.5)
+                    writer.write("\r\n"); await writer.drain()
+                    await asyncio.wait_for(reader.readuntil(b"UserDevice>"), timeout=5)
+                info("Telnet: Microhard CLI prompt detected")
+
+                async def send_and_wait_ok(cmd: str, timeout: float = 5.0) -> bool:
+                    info(f"Telnet: sending {cmd}")
+                    writer.write(cmd + "\r\n"); await writer.drain()
+                    # Read until OK or ERROR
+                    end_by = asyncio.get_event_loop().time() + timeout
+                    buf = ""
+                    while asyncio.get_event_loop().time() < end_by:
+                        try:
+                            chunk = await asyncio.wait_for(reader.read(128), timeout=0.5)
+                        except Exception:
+                            chunk = ""
+                        if chunk:
+                            # Normalize to text
+                            if isinstance(chunk, (bytes, bytearray)):
+                                chunk = chunk.decode("utf-8", errors="ignore")
+                            buf += chunk
+                            if "OK" in buf:
+                                info(f"Telnet: OK received for {cmd}")
+                                return True
+                            if "ERROR" in buf:
+                                warning(f"Telnet: ERROR received for {cmd}")
+                                return False
+                    tail = buf[-120:] if buf else ""
+                    warning(f"Telnet: timeout waiting for OK after {cmd}; tail='{tail}'")
+                    return False
+
+                # Try ordered fallback variants
+                variants = [
+                    ("AT+MSRTF", True),  # preferred two-step reset
+                    ("AT+MSRT", True),   # alternative two-step
+                    ("AT&F", False),     # factory reset (last resort)
+                ]
+
+                for base, two_step in variants:
+                    info(f"Telnet: attempting reset variant {base}")
+                    if two_step:
+                        ok1 = await send_and_wait_ok(f"{base}=0")
+                        if not ok1:
+                            info(f"Telnet: {base}=0 not acknowledged; trying next variant")
+                            continue
+                        ok2 = await send_and_wait_ok(f"{base}=1")
+                        if ok2:
+                            info(f"Telnet: reset acknowledged using variant {base}")
+                            break
+                        else:
+                            info(f"Telnet: {base}=1 not acknowledged; trying next variant")
+                            continue
+                    else:
+                        # Single-command factory reset
+                        ok = await send_and_wait_ok(base)
+                        if ok:
+                            warning("Used AT&F factory reset variant; settings may revert to full factory defaults")
+                            info("Telnet: reset acknowledged using variant AT&F")
+                            break
+                else:
+                    # None of the variants ACKed
+                    raise RuntimeError("No reset variant acknowledged with OK")
+            finally:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+
         try:
-            tn = telnetlib.Telnet(self.ip, 23, Config.TELNET_TIMEOUT)
-            
-            tn.read_until(b"login: ", timeout=5)
-            tn.write(self.username.encode() + b"\n")
-            
-            tn.read_until(b"Password: ", timeout=5)
-            tn.write(self.password.encode() + b"\n")
-            
-            time.sleep(1)
-            
-            tn.write(b"AT+MSRTF=0\r\n")
-            time.sleep(1)
-            
-            tn.write(b"AT+MSRTF=1\r\n")
-            time.sleep(1)
-            
-            tn.close()
-            
+            # Run the async telnet interaction
+            asyncio.run(_do_telnet_reset(self.ip, self.username, self.password))
             success("Safe reset completed")
             return True
-            
         except Exception as e:
-            error(f"Safe reset failed: {e}")
+            logger.exception("Safe reset failed during Telnet interaction")
+            error(f"Safe reset failed: {e!r}")
             return False
     
     def provision(self, config: RadioConfig) -> bool:

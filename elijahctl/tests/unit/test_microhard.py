@@ -10,7 +10,7 @@ class TestMicrohardDriver:
     
     @pytest.fixture
     def driver(self):
-        return MicrohardDriver("192.168.168.1", "admin", "admin")
+        return MicrohardDriver("192.168.168.1", "admin", "supercool")
     
     @pytest.fixture
     def air_config(self):
@@ -71,15 +71,16 @@ class TestMicrohardDriver:
     def test_ssh_execute_success(self, mock_ssh_client, driver):
         mock_client = MagicMock()
         mock_ssh_client.return_value = mock_client
-        
+        # Stub exec_command (fast path)
         mock_stdout = MagicMock()
-        mock_stdout.read.return_value = b"success"
         mock_stderr = MagicMock()
+        mock_stdout.read.return_value = b"success"
         mock_stderr.read.return_value = b""
-        
+        # Paramiko uses a channel to report status
+        mock_stdout.channel.recv_exit_status.return_value = 0
         mock_client.exec_command.return_value = (None, mock_stdout, mock_stderr)
-        
-        success, output = driver._ssh_execute("test command")
+
+        success, output = driver._ssh_execute("echo success", try_exec_first=True)
         
         assert success is True
         assert output == "success"
@@ -169,28 +170,50 @@ class TestMicrohardDriver:
         assert result is True
         assert mock_ubus_call.call_count > 0
     
-    @patch('telnetlib.Telnet')
-    def test_safe_reset(self, mock_telnet, driver):
-        mock_tn = MagicMock()
-        mock_telnet.return_value = mock_tn
-        
-        mock_tn.read_until.return_value = b"login: "
-        
+    @patch('telnetlib3.open_connection')
+    def test_safe_reset(self, mock_open_conn, driver):
+        class FakeReader:
+            def __init__(self):
+                self._prompt_given = False
+            async def readuntil(self, s):
+                # Accept bytes or str separator
+                sep_text = s.decode() if isinstance(s, (bytes, bytearray)) else str(s)
+                if "UserDevice>" in sep_text and not self._prompt_given:
+                    self._prompt_given = True
+                    return s if isinstance(s, (bytes, bytearray)) else "UserDevice>"
+                return ""
+            async def read(self, n):
+                # Always acknowledge with OK for simplicity
+                return "OK"
+        class FakeWriter:
+            def __init__(self):
+                self.buf = []
+            def write(self, s):
+                self.buf.append(s)
+            async def drain(self):
+                return None
+            def close(self):
+                pass
+            async def wait_closed(self):
+                return None
+
+        captured = {}
+        async def _fake(host, port, encoding):
+            r, w = FakeReader(), FakeWriter()
+            captured['writer'] = w
+            return (r, w)
+        mock_open_conn.side_effect = _fake
+
         with patch.object(driver, 'discover') as mock_discover:
             mock_discover.return_value = MicrohardConnection(
-                ip="192.168.168.1",
-                ssh_available=False,
-                http_available=False,
-                telnet_available=True
+                ip="192.168.168.1", ssh_available=False, http_available=False, telnet_available=True
             )
-            
-            result = driver.safe_reset()
-            
-            assert result is True
-            mock_tn.write.assert_any_call(b"admin\n")
-            mock_tn.write.assert_any_call(b"AT+MSRTF=0\r\n")
-            mock_tn.write.assert_any_call(b"AT+MSRTF=1\r\n")
-            mock_tn.close.assert_called_once()
+            assert driver.safe_reset() is True
+            # Verify ordered AT sequence
+            b = ''.join(captured['writer'].buf)
+            assert b.find('AT+MSRTF=0\r\n') != -1
+            assert b.find('AT+MSRTF=1\r\n') != -1
+            assert b.find('AT+MSRTF=0\r\n') < b.find('AT+MSRTF=1\r\n')
     
     @patch('elijahctl.drivers.microhard.find_mac_in_leases')
     @patch('time.sleep')

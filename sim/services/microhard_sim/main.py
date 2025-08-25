@@ -15,7 +15,7 @@ import telnetlib3
 STATE_PATH = Path(os.environ.get("STATE_PATH", "/sim/state.json"))
 LEASES_FILE = Path(os.environ.get("LEASES_FILE", "/leases/leases.json"))
 USERNAME = os.environ.get("USER", "admin")
-PASSWORD = os.environ.get("PASS", "admin")
+PASSWORD = os.environ.get("PASS", "supercool")
 ROLE = os.environ.get("ROLE", "air")
 
 

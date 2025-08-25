@@ -12,7 +12,7 @@ I cite the two source docs inline wherever they bind the process. &#x20;
 
 * `drone_id` (e.g., `012`) → names `el-012` (Jetson), `elijah-012-air` (air radio).&#x20;
 * `sysid` (e.g., `12`) → `MAV_SYS_ID`.&#x20;
-* Secrets: Microhard admin pass, AES‑128 key (`rainmaker` net), Tailscale key.&#x20;
+* Secrets: Microhard admin pass (default `supercool`), AES‑128 key (`rainmaker` net), Tailscale key.&#x20;
 * RemoteID module serial + FAA DB entry (manual but logged; shows on your sheet).
 * ESC param set version (from `v2_standard.cfg`) + ESC firmware build.&#x20;
 
@@ -67,7 +67,7 @@ def discover(ip="192.168.168.1"): return {"ssh":port_open(ip,22),"telnet":port_o
 
 ```python
 # ubus login + uci set + commit + reboot
-POST /cgi-bin/luci/rpc/auth {"id":1,"method":"login","params":["admin","admin"]}
+POST /cgi-bin/luci/rpc/auth {"id":1,"method":"login","params":["admin","supercool"]}
 → ubus_rpc_session
 POST /ubus {"jsonrpc":"2.0","id":2,"method":"call","params":[token,"uci","set",
  {"config":"system","section":"@system[0]","values":{"hostname":"elijah-012-air"}}]}
@@ -270,7 +270,7 @@ state/                  # signed JSON proofs + checklist rows
 **AT reset** over Telnet:
 
 ```
-login admin/admin
+login admin/supercool
 AT+MSRTF=0
 AT+MSRTF=1
 ```

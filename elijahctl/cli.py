@@ -57,7 +57,7 @@ def radio_profile(ip: str):
 @click.option('--drone-id', required=True, help='Drone ID (e.g., 012)')
 @click.option('--sysid', type=int, help='MAV_SYS_ID (required for air role)')
 @click.option('--aes-key', envvar='AES_KEY', required=True, help='AES-128 encryption key')
-@click.option('--microhard-pass', envvar='MICROHARD_PASS', default='admin', help='Microhard admin password')
+@click.option('--microhard-pass', envvar='MICROHARD_PASS', default='supercool', help='Microhard admin password')
 @click.option('--tailscale-key', envvar='TAILSCALE_KEY', help='Tailscale auth key (for air role)')
 @click.option('--ip', default=Config.DEFAULT_MICROHARD_IP, help='Radio IP address')
 @click.option('--yes', is_flag=True, help='Run without interactive prompts')
@@ -106,7 +106,7 @@ def provision(role: str, drone_id: str, sysid: Optional[int],
 @cli.command()
 @click.option('--ip', default=Config.DEFAULT_MICROHARD_IP, help='Radio IP address')
 @click.option('--user', default='admin', help='Radio username')
-@click.option('--password', default='admin', help='Radio password')
+@click.option('--password', default='supercool', help='Radio password')
 @click.option('--force', is_flag=True, help='Do not prompt for confirmation')
 def reset_radio(ip: str, user: str, password: str, force: bool):
     if not force and not confirm(f"This will reset the radio at {ip}. Continue?"):

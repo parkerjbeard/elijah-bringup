@@ -47,8 +47,8 @@ class RadioConfig:
 @dataclass
 class JetsonConfig:
     drone_id: str
-    device_name: str = ""
     sysid: int
+    device_name: str = ""
     ansible_host: str = "192.168.55.1"
     ansible_user: str = "jetson"
     tailscale_auth_key: str = ""
@@ -159,7 +159,7 @@ class Config:
     
     DEFAULT_MICROHARD_IP = "192.168.168.1"
     DEFAULT_MICROHARD_USER = "admin"
-    DEFAULT_MICROHARD_PASS = "admin"
+    DEFAULT_MICROHARD_PASS = "supercool"
     
     SSH_TIMEOUT = 10
     HTTP_TIMEOUT = 10

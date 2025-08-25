@@ -345,7 +345,8 @@ class HealthCheck:
             )
             
             pth_path = os.environ.get("ELIJAH_PTH_PATH", "/var/log/seraph/pth.json")
-            stdin, stdout, stderr = client.exec_command(f"cat {pth_path} 2>/dev/null || echo '{}'")
+            # Use '{{}}' to emit literal '{}' in an f-string
+            stdin, stdout, stderr = client.exec_command(f"cat {pth_path} 2>/dev/null || echo '{{}}'")
             output = stdout.read().decode('utf-8')
             client.close()
             

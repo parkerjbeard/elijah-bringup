@@ -54,7 +54,7 @@ class TestIntegration:
             '--drone-id', '012',
             '--sysid', '12',
             '--aes-key', 'test_key_128',
-            '--microhard-pass', 'admin'
+            '--microhard-pass', 'supercool'
         ])
         
         assert result.exit_code == 0
