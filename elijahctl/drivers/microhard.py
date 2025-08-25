@@ -428,6 +428,161 @@ class MicrohardDriver:
         except Exception as e:
             logger.error(f"SSH(AT) session error: {e}")
             return False, str(e)
+
+    async def _telnet_execute_at_session_async(self, commands: list[str], *, per_cmd_timeout: float = 5.0) -> Tuple[bool, str]:
+        """Async helper: run AT commands over Telnet using telnetlib3.
+
+        - Opens a telnet connection on port 23.
+        - If login prompts appear, sends username/password.
+        - Ensures prompt then iterates through commands, waiting for OK/ERROR.
+        Returns (success, aggregated_output).
+        """
+        reader, writer = await asyncio.wait_for(
+            telnetlib3.open_connection(self.ip, 23, encoding="utf8"),
+            timeout=Config.TELNET_TIMEOUT,
+        )
+        buf_all = ""
+        try:
+            # Provoke prompt and perform login handshake until we see UserDevice>
+            writer.write("\r\n"); await writer.drain()
+            await asyncio.sleep(0.3)
+            sent_user = False
+            sent_pass = False
+            end_by = asyncio.get_event_loop().time() + 8.0
+            while asyncio.get_event_loop().time() < end_by:
+                try:
+                    chunk = await asyncio.wait_for(reader.read(256), timeout=0.5)
+                except asyncio.TimeoutError:
+                    chunk = ""
+                if chunk:
+                    if isinstance(chunk, (bytes, bytearray)):
+                        chunk = chunk.decode("utf-8", errors="ignore")
+                    buf_all += chunk
+                    low = buf_all.lower()
+                    if not sent_user and ("login:" in low or "username:" in low):
+                        writer.write(self.username + "\r\n"); await writer.drain()
+                        sent_user = True
+                        continue
+                    if sent_user and not sent_pass and ("password:" in low):
+                        writer.write(self.password + "\r\n"); await writer.drain()
+                        sent_pass = True
+                        continue
+                    if "login incorrect" in low:
+                        return False, buf_all
+                    if "UserDevice>" in buf_all:
+                        break
+                else:
+                    writer.write("\r\n"); await writer.drain()
+            else:
+                return False, buf_all
+
+            async def send_wait_ok(cmd: str) -> Tuple[bool, str]:
+                local_buf = ""
+                writer.write(cmd + "\r\n"); await writer.drain()
+                deadline = asyncio.get_event_loop().time() + per_cmd_timeout
+                while asyncio.get_event_loop().time() < deadline:
+                    try:
+                        chunk = await asyncio.wait_for(reader.read(128), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        chunk = ""
+                    if chunk:
+                        if isinstance(chunk, (bytes, bytearray)):
+                            chunk = chunk.decode("utf-8", errors="ignore")
+                        local_buf += chunk
+                        if "login incorrect" in local_buf.lower():
+                            return False, local_buf
+                        if "ERROR" in local_buf:
+                            return False, local_buf
+                        if "OK" in local_buf:
+                            return True, local_buf
+                return False, local_buf
+
+            for cmd in commands:
+                info(f"AT(telnet): {cmd}")
+                ok, out = await send_wait_ok(cmd)
+                buf_all += out
+                if not ok:
+                    return False, buf_all
+            return True, buf_all
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+    def _telnet_execute_at_session(self, commands: list[str], *, per_cmd_timeout: float = 5.0) -> Tuple[bool, str]:
+        try:
+            return asyncio.run(self._telnet_execute_at_session_async(commands, per_cmd_timeout=per_cmd_timeout))
+        except Exception as e:
+            logger.error(f"Telnet AT session error: {e}")
+            return False, str(e)
+
+    def _build_at_commands_from_staged(self) -> list:
+        """Translate staged_config and semantic params into AT command list."""
+        at_cmds: list[str] = []
+        # System
+        try:
+            hostname = self.staged_config.get('system', {}).get('@system[0]', {}).get('hostname')
+            if hostname:
+                at_cmds.append(f"AT+MSMNAME={hostname}")
+            if self.staged_config.get('system', {}).get('@system[0]', {}).get('description'):
+                warning("System description is not supported via AT; skipping")
+        except Exception:
+            pass
+        # Wireless
+        if self._radio_params:
+            role = str(self._radio_params.get('role') or '').strip()
+            mode_val = 0 if role.lower() == 'master' else 1
+            at_cmds.append(f"AT+MWVMODE={mode_val}")
+            try:
+                freq = int(self._radio_params.get('freq_mhz'))
+                at_cmds.append(f"AT+MWFREQ={freq}")
+            except Exception:
+                warning("Invalid frequency in staged params; skipping")
+            try:
+                bw = int(self._radio_params.get('bw_mhz'))
+                bw_code_map = {5: 0, 10: 1, 20: 2, 40: 3}
+                bw_code = bw_code_map.get(bw, 0)
+                if bw_code == 0 and bw != 5:
+                    warning(f"Unsupported bandwidth {bw} MHz; using 5 MHz (code 0)")
+                at_cmds.append(f"AT+MWBAND={bw_code}")
+            except Exception:
+                warning("Invalid bandwidth in staged params; skipping")
+            net_id = self._radio_params.get('net_id')
+            if net_id:
+                at_cmds.append(f"AT+MWNETWORKID={net_id}")
+            try:
+                txp = int(self._radio_params.get('tx_power'))
+                warning(f"Skipping TX power setting (value: {txp}) - command not supported on this model")
+                # at_cmds.append(f"AT+MWTXPOWER={txp}")
+            except Exception:
+                warning("Invalid tx_power in staged params; skipping")
+            encrypt_enable = str(self._radio_params.get('encrypt_enable') or '0').strip()
+            aes_key = self._radio_params.get('aes_key')
+            if encrypt_enable == '1' and aes_key:
+                at_cmds.append(f"AT+MWVENCRYPT=1,{aes_key}")
+            else:
+                at_cmds.append("AT+MWVENCRYPT=0")
+        # Network
+        try:
+            if self.staged_config.get('network', {}).get('lan', {}).get('proto') == 'dhcp':
+                at_cmds.append("AT+MNIFACE=lan,EDIT,0")
+        except Exception:
+            pass
+        # Stats
+        if self._stats_params:
+            try:
+                enabled = str(self._stats_params.get('enable') or '0')
+                port = int(self._stats_params.get('port') or 22222)
+                interval = int(self._stats_params.get('interval') or 1000)
+                if enabled == '1':
+                    at_cmds.append(f"AT+MRFRPT=1,{port},{interval}")
+                else:
+                    at_cmds.append("AT+MRFRPT=0")
+            except Exception:
+                warning("Invalid stats params; skipping AT+MRFRPT")
+        # Save
+        at_cmds.append("AT&W")
+        return at_cmds
     
     def _ubus_login(self) -> Optional[str]:
         """Authenticate to the device, preferring LuCI RPC then falling back to raw ubus."""
@@ -707,90 +862,8 @@ class MicrohardDriver:
     def apply_via_ssh(self) -> bool:
         info("Applying configuration via SSH (AT CLI)")
         logger.debug(f"Using SSH credentials - username: {self.username}, password: {'*' * len(self.password)}")
-
         # Build AT command sequence from staged params
-        at_cmds: list[str] = []
-
-        # System: hostname; description is WebUI-only per manual (skip with warning)
-        try:
-            hostname = self.staged_config.get('system', {}).get('@system[0]', {}).get('hostname')
-            if hostname:
-                at_cmds.append(f"AT+MSMNAME={hostname}")
-            if self.staged_config.get('system', {}).get('@system[0]', {}).get('description'):
-                warning("System description is not supported via AT; skipping")
-        except Exception:
-            pass
-
-        # Wireless radio settings
-        if self._radio_params:
-            # Role: Master=0, Slave=1
-            role = str(self._radio_params.get('role') or '').strip()
-            mode_val = 0 if role.lower() == 'master' else 1
-            at_cmds.append(f"AT+MWVMODE={mode_val}")
-
-            # Frequency MHz
-            try:
-                freq = int(self._radio_params.get('freq_mhz'))
-                at_cmds.append(f"AT+MWFREQ={freq}")
-            except Exception:
-                warning("Invalid frequency in staged params; skipping")
-
-            # Bandwidth mapping: 5 MHz -> 0 (manual reference)
-            try:
-                bw = int(self._radio_params.get('bw_mhz'))
-                bw_code_map = {5: 0, 10: 1, 20: 2, 40: 3}
-                bw_code = bw_code_map.get(bw)
-                if bw_code is None:
-                    warning(f"Unsupported bandwidth {bw} MHz; using 5 MHz (code 0)")
-                    bw_code = 0
-                at_cmds.append(f"AT+MWBAND={bw_code}")
-            except Exception:
-                warning("Invalid bandwidth in staged params; skipping")
-
-            # Network ID
-            net_id = self._radio_params.get('net_id')
-            if net_id:
-                at_cmds.append(f"AT+MWNETWORKID={net_id}")
-
-            # TX Power
-            try:
-                txp = int(self._radio_params.get('tx_power'))
-                at_cmds.append(f"AT+MWTXPOWER={txp}")
-            except Exception:
-                warning("Invalid tx_power in staged params; skipping")
-
-            # Encryption: AES-128 per manual; disable when encrypt_enable != '1'
-            encrypt_enable = str(self._radio_params.get('encrypt_enable') or '0').strip()
-            aes_key = self._radio_params.get('aes_key')
-            if encrypt_enable == '1' and aes_key:
-                # Manual indicates MWVENCRYPT requires type + key; use type 1 for AES-128
-                at_cmds.append(f"AT+MWVENCRYPT=1,{aes_key}")
-            else:
-                at_cmds.append("AT+MWVENCRYPT=0")
-
-        # Network interface: switch LAN to DHCP client when requested
-        try:
-            if self.staged_config.get('network', {}).get('lan', {}).get('proto') == 'dhcp':
-                at_cmds.append("AT+MNIFACE=lan,EDIT,0")
-        except Exception:
-            pass
-
-        # Radio Stats stream
-        if self._stats_params:
-            try:
-                enabled = str(self._stats_params.get('enable') or '0')
-                port = int(self._stats_params.get('port') or 22222)
-                interval = int(self._stats_params.get('interval') or 1000)
-                if enabled == '1':
-                    # Per manual, configure enable + port + interval; server IP is external
-                    at_cmds.append(f"AT+MRFRPT=1,{port},{interval}")
-                else:
-                    at_cmds.append("AT+MRFRPT=0")
-            except Exception:
-                warning("Invalid stats params; skipping AT+MRFRPT")
-
-        # Save once at end
-        at_cmds.append("AT&W")
+        at_cmds = self._build_at_commands_from_staged()
 
         ok, out = self._ssh_execute_at_session(at_cmds)
         if not ok:
@@ -890,9 +963,21 @@ class MicrohardDriver:
                 result = self.apply_via_http()
                 if result:
                     success("Configuration applied via HTTP fallback")
+            if not result and connection.telnet_available:
+                warning("SSH/HTTP failed, attempting Telnet AT fallback")
+                at_cmds = self._build_at_commands_from_staged()
+                result, _ = self._telnet_execute_at_session(at_cmds)
+                if result:
+                    success("Configuration applied via Telnet AT fallback")
         elif connection.http_available:
             info("Using HTTP/ubus for configuration")
             result = self.apply_via_http()
+            if not result and connection.telnet_available:
+                warning("HTTP failed, attempting Telnet AT fallback")
+                at_cmds = self._build_at_commands_from_staged()
+                result, _ = self._telnet_execute_at_session(at_cmds)
+                if result:
+                    success("Configuration applied via Telnet AT fallback")
         else:
             error("No suitable connection method available")
             return False
@@ -907,25 +992,36 @@ class MicrohardDriver:
         return result
     
     def reboot(self) -> bool:
-        info("Rebooting radio...")
-        
+        info("Rebooting radio via AT command")
+
         connection = self.discover()
-        
+
+        # Prefer SSH AT session
         if connection.ssh_available:
-            logger.debug("Sending reboot via SSH")
-            success_flag, output = self._ssh_execute("sync; reboot")
-            if success_flag:
-                success("Reboot command sent via SSH")
+            try:
+                ok, out = self._ssh_execute_at_session(["AT+MSREB"])
+                if ok:
+                    success("Reboot command acknowledged via SSH AT")
+                    return True
+                # Some firmware may reboot immediately without sending OK; treat as best-effort
+                warning("SSH AT reboot may have been issued without OK; proceeding")
                 return True
-        
-        if connection.http_available and self.session_token:
-            logger.debug("Sending reboot via HTTP/ubus")
-            result = self._ubus_call("system", "reboot", {})
-            if result:
-                success("Reboot command sent via HTTP")
+            except Exception as e:
+                logger.debug(f"SSH AT reboot path failed: {e}")
+
+        # Fallback to Telnet AT session
+        if connection.telnet_available:
+            try:
+                ok, out = self._telnet_execute_at_session(["AT+MSREB"]) 
+                if ok:
+                    success("Reboot command acknowledged via Telnet AT")
+                    return True
+                warning("Telnet AT reboot may have been issued without OK; proceeding")
                 return True
-        
-        error("Failed to send reboot command")
+            except Exception as e:
+                logger.debug(f"Telnet AT reboot path failed: {e}")
+
+        error("Failed to send reboot command via available methods")
         return False
     
     def wait_for_dhcp_flip(self, timeout: int = 120) -> Optional[str]:
@@ -965,63 +1061,44 @@ class MicrohardDriver:
                 # Telnet may expose either Microhard CLI or require login first
                 info(f"Telnet: session opened to {host}:23; detecting prompt type")
                 
-                # Send a newline and wait a bit to see what prompt we get
+                # Try to reach the CLI prompt with basic auth handshake
                 writer.write("\r\n"); await writer.drain()
-                await asyncio.sleep(0.5)
-                
-                # Try to read any initial output
-                initial_data = ""
-                try:
-                    initial_data = await asyncio.wait_for(reader.read(1024), timeout=2)
-                    if isinstance(initial_data, bytes):
-                        initial_data = initial_data.decode("utf-8", errors="ignore")
-                    logger.debug(f"Initial telnet response: {initial_data[-100:]}")
-                except asyncio.TimeoutError:
-                    logger.debug("No initial response from telnet")
-                
-                # Check if we need to login or are already at a prompt
-                if "login:" in initial_data.lower() or "username:" in initial_data.lower():
-                    info("Telnet: Login prompt detected, authenticating")
-                    writer.write(username + "\r\n"); await writer.drain()
-                    await asyncio.sleep(0.5)
-                    
-                    # Wait for password prompt
+                await asyncio.sleep(0.3)
+                buf = ""
+                sent_user = False
+                sent_pass = False
+                end_by = asyncio.get_event_loop().time() + 8.0
+                while asyncio.get_event_loop().time() < end_by:
                     try:
-                        pw_data = await asyncio.wait_for(reader.read(256), timeout=2)
-                        if isinstance(pw_data, bytes):
-                            pw_data = pw_data.decode("utf-8", errors="ignore")
+                        chunk = await asyncio.wait_for(reader.read(256), timeout=0.5)
                     except asyncio.TimeoutError:
-                        pw_data = ""
-                    
-                    if "password:" in pw_data.lower():
-                        writer.write(password + "\r\n"); await writer.drain()
-                        await asyncio.sleep(0.5)
-                
-                # Now look for any prompt (UserDevice>, #, $, etc)
-                writer.write("\r\n"); await writer.drain()
-                await asyncio.sleep(0.5)
-                
-                # Read whatever prompt we have
-                prompt_data = ""
-                try:
-                    prompt_data = await asyncio.wait_for(reader.read(256), timeout=2)
-                    if isinstance(prompt_data, bytes):
-                        prompt_data = prompt_data.decode("utf-8", errors="ignore")
-                    logger.debug(f"Prompt data: {prompt_data[-50:]}")
-                except asyncio.TimeoutError:
-                    logger.debug("No prompt received")
-                
-                # Determine if we're in CLI or shell
-                if "UserDevice>" in prompt_data or "#" in prompt_data or "$" in prompt_data:
-                    if "UserDevice>" in prompt_data:
-                        info("Telnet: Microhard CLI prompt detected")
+                        chunk = ""
+                    if chunk:
+                        if isinstance(chunk, (bytes, bytearray)):
+                            chunk = chunk.decode("utf-8", errors="ignore")
+                        buf += chunk
+                        low = buf.lower()
+                        if not sent_user and ("login:" in low or "username:" in low):
+                            info("Telnet: Login prompt detected, authenticating")
+                            writer.write(username + "\r\n"); await writer.drain()
+                            sent_user = True
+                            continue
+                        if sent_user and not sent_pass and ("password:" in low):
+                            writer.write(password + "\r\n"); await writer.drain()
+                            sent_pass = True
+                            # continue reading until prompt
+                            continue
+                        if "login incorrect" in low:
+                            raise RuntimeError("Telnet login incorrect")
+                        if "UserDevice>" in buf:
+                            info("Telnet: Microhard CLI prompt detected")
+                            break
                     else:
-                        info("Telnet: Shell prompt detected")
+                        # Nudge prompt
+                        writer.write("\r\n"); await writer.drain()
                 else:
-                    # Try one more newline to get a prompt
-                    writer.write("\r\n"); await writer.drain()
-                    await asyncio.sleep(0.5)
-                    info("Telnet: Proceeding with AT commands")
+                    # Timed out waiting for CLI prompt
+                    raise RuntimeError("No CLI prompt on Telnet after auth")
 
                 async def send_and_wait_ok(cmd: str, timeout: float = 5.0) -> bool:
                     info(f"Telnet: sending {cmd}")
@@ -1040,6 +1117,9 @@ class MicrohardDriver:
                                 chunk = chunk.decode("utf-8", errors="ignore")
                             buf += chunk
                             logger.debug(f"Response buffer: {buf[-100:]}")
+                            if "login incorrect" in chunk.lower():
+                                warning("Telnet: login failed during command")
+                                return False
                             if "OK" in buf:
                                 info(f"Telnet: OK received for {cmd}")
                                 return True
@@ -1048,43 +1128,60 @@ class MicrohardDriver:
                                 return False
                     tail = buf[-120:] if buf else ""
                     warning(f"Telnet: timeout waiting for OK after {cmd}; tail='{tail}'")
-                    # If we didn't get OK/ERROR but got some response, assume it worked
-                    if len(buf) > 0:
-                        info(f"Telnet: Got response but no OK/ERROR, assuming success")
-                        return True
                     return False
 
-                # Try ordered fallback variants
-                variants = [
-                    ("AT+MSRTF", True),  # preferred two-step reset
-                    ("AT+MSRT", True),   # alternative two-step
-                    ("AT&F", False),     # factory reset (last resort)
-                ]
+                async def send_and_confirm(cmd: str, timeout: float = 5.0) -> bool:
+                    """Send command and handle confirmation prompts."""
+                    info(f"Telnet: sending {cmd}")
+                    writer.write(cmd + "\r\n"); await writer.drain()
+                    # Read response
+                    end_by = asyncio.get_event_loop().time() + timeout
+                    buf = ""
+                    while asyncio.get_event_loop().time() < end_by:
+                        try:
+                            chunk = await asyncio.wait_for(reader.read(128), timeout=0.5)
+                        except Exception:
+                            chunk = b""
+                        if chunk:
+                            if isinstance(chunk, (bytes, bytearray)):
+                                chunk = chunk.decode("utf-8", errors="ignore")
+                            buf += chunk
+                            logger.debug(f"Response buffer: {buf[-200:]}")
+                            
+                            # Check for confirmation prompts
+                            if "Please confirm action" in buf or "confirm" in buf.lower():
+                                info("Telnet: Confirmation requested, sending AT+MSRTF=1")
+                                writer.write("AT+MSRTF=1\r\n"); await writer.drain()
+                                # Clear buffer to avoid re-triggering confirmation
+                                buf = ""
+                                # Continue reading for OK
+                                continue
+                            
+                            if "OK" in buf:
+                                info(f"Telnet: OK received for {cmd}")
+                                return True
+                            if "ERROR" in buf:
+                                warning(f"Telnet: ERROR received for {cmd}")
+                                return False
+                    warning(f"Telnet: timeout for {cmd}")
+                    return False
 
-                for base, two_step in variants:
-                    info(f"Telnet: attempting reset variant {base}")
-                    if two_step:
-                        ok1 = await send_and_wait_ok(f"{base}=0")
-                        if not ok1:
-                            info(f"Telnet: {base}=0 not acknowledged; trying next variant")
-                            continue
-                        ok2 = await send_and_wait_ok(f"{base}=1")
-                        if ok2:
-                            info(f"Telnet: reset acknowledged using variant {base}")
-                            break
-                        else:
-                            info(f"Telnet: {base}=1 not acknowledged; trying next variant")
-                            continue
-                    else:
-                        # Single-command factory reset
-                        ok = await send_and_wait_ok(base)
-                        if ok:
-                            warning("Used AT&F factory reset variant; settings may revert to full factory defaults")
-                            info("Telnet: reset acknowledged using variant AT&F")
-                            break
+                # Try reset with confirmation handling
+                info("Telnet: attempting reset AT+MSRTF")
+                ok = await send_and_confirm("AT+MSRTF=0", timeout=8.0)
+                if ok:
+                    info("Telnet: reset acknowledged")
                 else:
-                    # None of the variants ACKed
-                    raise RuntimeError("No reset variant acknowledged with OK")
+                    # Try alternative reset commands
+                    warning("AT+MSRTF failed, trying alternatives")
+                    for cmd in ["AT+MSRT", "AT&F"]:
+                        info(f"Telnet: attempting {cmd}")
+                        ok = await send_and_wait_ok(cmd)
+                        if ok:
+                            info(f"Telnet: reset acknowledged using {cmd}")
+                            break
+                    else:
+                        raise RuntimeError("No reset variant acknowledged with OK")
             finally:
                 writer.close()
                 with contextlib.suppress(Exception):
@@ -1121,10 +1218,30 @@ class MicrohardDriver:
             # Give device a moment to flush NVRAM
             time.sleep(2)
             return True
-        else:
-            error("Password change failed via AT CLI")
-            logger.debug(f"AT password change output: {out[-200:] if out else out}")
-            return False
+        # Fallback to Telnet AT if available
+        try:
+            connection = self.discover()
+        except Exception:
+            connection = MicrohardConnection(self.ip, False, False, False)
+        if getattr(connection, 'telnet_available', False):
+            warning("SSH failed; attempting password change via Telnet AT")
+            ok2, out2 = self._telnet_execute_at_session(cmds)
+            if ok2:
+                success("Password changed and saved via Telnet AT")
+                self.password = new_password
+                time.sleep(2)
+                return True
+
+        error("Password change failed via AT CLI")
+        # Prefer Telnet error output if available
+        tail = ""
+        if 'out2' in locals() and out2:
+            tail = out2[-200:]
+        elif out:
+            tail = out[-200:]
+        if tail:
+            logger.debug(f"AT password change output: {tail}")
+        return False
     
     def provision(self, config: RadioConfig) -> bool:
         try:
