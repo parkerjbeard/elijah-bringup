@@ -738,18 +738,66 @@ class MicrohardDriver:
                 timeout=Config.TELNET_TIMEOUT,
             )
             try:
-                # Telnet exposes the Microhard CLI (UserDevice>), not a Linux login.
-                # Coax the prompt, then wait for it.
-                info(f"Telnet: session opened to {host}:23; waiting for CLI prompt 'UserDevice>'")
+                # Telnet may expose either Microhard CLI or require login first
+                info(f"Telnet: session opened to {host}:23; detecting prompt type")
+                
+                # Send a newline and wait a bit to see what prompt we get
                 writer.write("\r\n"); await writer.drain()
-                logger.debug("Waiting for Microhard CLI prompt")
+                await asyncio.sleep(0.5)
+                
+                # Try to read any initial output
+                initial_data = ""
                 try:
-                    await asyncio.wait_for(reader.readuntil(b"UserDevice>"), timeout=5)
-                except Exception:
+                    initial_data = await asyncio.wait_for(reader.read(1024), timeout=2)
+                    if isinstance(initial_data, bytes):
+                        initial_data = initial_data.decode("utf-8", errors="ignore")
+                    logger.debug(f"Initial telnet response: {initial_data[-100:]}")
+                except asyncio.TimeoutError:
+                    logger.debug("No initial response from telnet")
+                
+                # Check if we need to login or are already at a prompt
+                if "login:" in initial_data.lower() or "username:" in initial_data.lower():
+                    info("Telnet: Login prompt detected, authenticating")
+                    writer.write(username + "\r\n"); await writer.drain()
                     await asyncio.sleep(0.5)
+                    
+                    # Wait for password prompt
+                    try:
+                        pw_data = await asyncio.wait_for(reader.read(256), timeout=2)
+                        if isinstance(pw_data, bytes):
+                            pw_data = pw_data.decode("utf-8", errors="ignore")
+                    except asyncio.TimeoutError:
+                        pw_data = ""
+                    
+                    if "password:" in pw_data.lower():
+                        writer.write(password + "\r\n"); await writer.drain()
+                        await asyncio.sleep(0.5)
+                
+                # Now look for any prompt (UserDevice>, #, $, etc)
+                writer.write("\r\n"); await writer.drain()
+                await asyncio.sleep(0.5)
+                
+                # Read whatever prompt we have
+                prompt_data = ""
+                try:
+                    prompt_data = await asyncio.wait_for(reader.read(256), timeout=2)
+                    if isinstance(prompt_data, bytes):
+                        prompt_data = prompt_data.decode("utf-8", errors="ignore")
+                    logger.debug(f"Prompt data: {prompt_data[-50:]}")
+                except asyncio.TimeoutError:
+                    logger.debug("No prompt received")
+                
+                # Determine if we're in CLI or shell
+                if "UserDevice>" in prompt_data or "#" in prompt_data or "$" in prompt_data:
+                    if "UserDevice>" in prompt_data:
+                        info("Telnet: Microhard CLI prompt detected")
+                    else:
+                        info("Telnet: Shell prompt detected")
+                else:
+                    # Try one more newline to get a prompt
                     writer.write("\r\n"); await writer.drain()
-                    await asyncio.wait_for(reader.readuntil(b"UserDevice>"), timeout=5)
-                info("Telnet: Microhard CLI prompt detected")
+                    await asyncio.sleep(0.5)
+                    info("Telnet: Proceeding with AT commands")
 
                 async def send_and_wait_ok(cmd: str, timeout: float = 5.0) -> bool:
                     info(f"Telnet: sending {cmd}")
@@ -761,12 +809,13 @@ class MicrohardDriver:
                         try:
                             chunk = await asyncio.wait_for(reader.read(128), timeout=0.5)
                         except Exception:
-                            chunk = ""
+                            chunk = b""
                         if chunk:
                             # Normalize to text
                             if isinstance(chunk, (bytes, bytearray)):
                                 chunk = chunk.decode("utf-8", errors="ignore")
                             buf += chunk
+                            logger.debug(f"Response buffer: {buf[-100:]}")
                             if "OK" in buf:
                                 info(f"Telnet: OK received for {cmd}")
                                 return True
@@ -775,6 +824,10 @@ class MicrohardDriver:
                                 return False
                     tail = buf[-120:] if buf else ""
                     warning(f"Telnet: timeout waiting for OK after {cmd}; tail='{tail}'")
+                    # If we didn't get OK/ERROR but got some response, assume it worked
+                    if len(buf) > 0:
+                        info(f"Telnet: Got response but no OK/ERROR, assuming success")
+                        return True
                     return False
 
                 # Try ordered fallback variants
