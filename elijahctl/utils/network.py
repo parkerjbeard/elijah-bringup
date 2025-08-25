@@ -21,10 +21,15 @@ def port_open(host: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 def discover_services(ip: str = "192.168.168.1", timeout: float = 2.0) -> Dict[str, bool]:
+    """Probe common Microhard services on the target IP.
+
+    Includes SSH (22), Telnet (23), HTTP (80) and HTTPS (443).
+    """
     return {
         "ssh": port_open(ip, 22, timeout),
         "telnet": port_open(ip, 23, timeout),
-        "http": port_open(ip, 80, timeout)
+        "http": port_open(ip, 80, timeout),
+        "https": port_open(ip, 443, timeout),
     }
 
 def ping_host(host: str, count: int = 3, timeout: int = 2) -> Tuple[bool, Optional[float]]:
@@ -154,6 +159,23 @@ def _local_networks() -> List[ipaddress.IPv4Interface]:
     except Exception:
         pass
     return nets
+
+def ip_on_local_network(ip: str) -> bool:
+    """Return True if `ip` is within any local interface network.
+
+    Useful to warn when the target is unreachable because the host lacks
+    an interface on the same subnet (e.g., 192.168.168.0/24).
+    """
+    try:
+        ip_addr = ipaddress.ip_address(ip)
+        if not isinstance(ip_addr, ipaddress.IPv4Address):
+            return False
+        for iface in _local_networks():
+            if ip_addr in iface.network:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def find_mac_in_leases(mac_address: str, subnet: Optional[str] = None) -> Optional[str]:

@@ -1,6 +1,7 @@
 import time
 import shlex
 import json
+import re
 import logging
 import asyncio
 import contextlib
@@ -88,6 +89,30 @@ class MicrohardDriver:
         self._radio_params: Dict[str, Any] = {}
         self._stats_params: Dict[str, Any] = {}
         
+    # Choose https if 443 is open; otherwise http.
+    def _http_base(self) -> str:
+        try:
+            if port_open(self.ip, 443, timeout=0.3):
+                return f"https://{self.ip}"
+        except Exception:
+            pass
+        return f"http://{self.ip}"
+
+    def _resolve_section_id_http(self, config: str, type_: str, index: int = 0) -> Optional[str]:
+        """Resolve @type[index] to a concrete UCI section id via ubus uci.get_all."""
+        j = self._ubus_call("uci", "get_all", {"config": config})
+        try:
+            # Expected shape: {"result":[0,{"values":{"cfgXXXX":{"._":...,".type":"type", ...}, ...}}]}
+            res = j.get("result", []) if isinstance(j, dict) else []
+            if len(res) > 1 and isinstance(res[1], dict):
+                values = res[1].get("values") or {}
+                candidates = [sid for sid, sec in values.items() if isinstance(sec, dict) and sec.get(".type") == type_]
+                if len(candidates) > index:
+                    return candidates[index]
+        except Exception:
+            pass
+        return None
+
     def _detect_profile_via_http(self) -> Optional[MHProfile]:
         """Detect Microhard UCI profile over HTTP using ubus with auth.
 
@@ -171,7 +196,7 @@ class MicrohardDriver:
     def _ssh_execute(self, command: str, *, try_exec_first: bool = True) -> Tuple[bool, str]:
         try:
             logger.debug(f"SSH connecting to {self.ip} as {self.username} with password: {'*' * len(self.password)}")
-            logger.debug(f"SSH Credentials - user: '{self.username}', pass_len: {len(self.password)}, pass_value: '{self.password}'")
+            logger.debug(f"SSH credentials - user: '{self.username}', pass_len: {len(self.password)} (value masked)")
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(
@@ -273,7 +298,6 @@ class MicrohardDriver:
         except paramiko.AuthenticationException as e:
             logger.error(f"SSH authentication failed for {self.username}@{self.ip}: {e}")
             logger.debug(f"Attempted credentials - username: {self.username}, password length: {len(self.password)}")
-            logger.debug(f"Password value (for debugging): '{self.password}'")
             logger.debug("Common issues:")
             logger.debug("  1. Check if password is correct (default: 'admin')")
             logger.debug("  2. Verify username is 'admin'")
@@ -288,16 +312,133 @@ class MicrohardDriver:
         except Exception as e:
             logger.error(f"SSH execution failed: {e}")
             return False, str(e)
+
+    def _ssh_execute_at_session(self, commands: list[str]) -> Tuple[bool, str]:
+        """Run a sequence of AT commands inside the Microhard SSH CLI.
+
+        - Opens a persistent interactive shell via paramiko and verifies the
+          proprietary CLI prompt ("UserDevice>").
+        - Sends each command with a trailing newline and reads responses until
+          either "OK" (success) or "ERROR" (failure) or timeout per-command.
+        - Aggregates all output and returns (success, aggregated_output).
+
+        This is required because the Microhard SSH endpoint drops directly into
+        a CLI that only accepts AT commands and does not provide a Linux shell.
+        """
+        try:
+            logger.debug(f"SSH(AT) connecting to {self.ip} as {self.username}")
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                self.ip,
+                username=self.username,
+                password=self.password,
+                timeout=Config.SSH_TIMEOUT,
+                allow_agent=False,
+                look_for_keys=False,
+            )
+
+            chan = client.invoke_shell()
+            # Use a modest read timeout; we'll still loop with our own deadline
+            try:
+                chan.settimeout(1.0)
+            except Exception:
+                pass
+
+            # Nudge the CLI to print a prompt, then verify it's the Microhard CLI
+            agg_out = ""
+            start = time.time()
+            deadline = start + 5.0
+            try:
+                chan.send("\n")
+            except Exception:
+                pass
+            while time.time() < deadline:
+                if chan.recv_ready():
+                    chunk = chan.recv(4096).decode("utf-8", errors="ignore")
+                    agg_out += chunk
+                    if "UserDevice>" in agg_out:
+                        break
+                else:
+                    time.sleep(0.05)
+            if "UserDevice>" not in agg_out:
+                logger.error("Did not observe Microhard CLI prompt 'UserDevice>' after login")
+                try:
+                    chan.close()
+                finally:
+                    client.close()
+                return False, agg_out.strip()
+
+            # Helper to send a single AT command and wait for OK/ERROR
+            def send_and_wait(cmd: str, timeout: float = 5.0) -> Tuple[bool, str]:
+                buf = ""
+                try:
+                    chan.send(cmd + "\n")
+                except Exception as e:
+                    return False, f"send failed: {e}"
+                end_by = time.time() + timeout
+                last_any = time.time()
+                while time.time() < end_by:
+                    if chan.recv_ready():
+                        try:
+                            data = chan.recv(4096)
+                            if not data:
+                                time.sleep(0.02)
+                                continue
+                            chunk = data.decode("utf-8", errors="ignore")
+                        except Exception:
+                            chunk = ""
+                        if chunk:
+                            buf += chunk
+                            last_any = time.time()
+                            # Check for terminal responses
+                            if "ERROR" in buf:
+                                return False, buf
+                            if "OK" in buf:
+                                return True, buf
+                    else:
+                        # Small sleep to avoid busy loop
+                        time.sleep(0.05)
+                # Timed out waiting for an explicit OK/ERROR
+                return False, buf
+
+            # Execute the sequence
+            for cmd in commands:
+                info(f"AT: {cmd}")
+                ok, resp = send_and_wait(cmd)
+                agg_out += resp
+                if not ok:
+                    warning(f"AT command failed or timed out: {cmd}")
+                    try:
+                        chan.close()
+                    finally:
+                        client.close()
+                    return False, agg_out.strip()
+
+            # All commands OK; close channel and return
+            try:
+                chan.close()
+            finally:
+                client.close()
+            return True, agg_out.strip()
+
+        except paramiko.AuthenticationException as e:
+            logger.error(f"SSH(AT) authentication failed for {self.username}@{self.ip}: {e}")
+            return False, f"Authentication failed: {e}"
+        except Exception as e:
+            logger.error(f"SSH(AT) session error: {e}")
+            return False, str(e)
     
     def _ubus_login(self) -> Optional[str]:
         """Authenticate to the device, preferring LuCI RPC then falling back to raw ubus."""
         # Create session with SSL verification disabled for weak/self-signed certificates
         session = requests.Session()
         session.verify = False
+        base = self._http_base()
         
         # First try LuCI RPC auth proxy
         try:
-            url = f"http://{self.ip}/cgi-bin/luci/rpc/auth"
+            url = f"{base}/cgi-bin/luci/rpc/auth"
             payload = {"id": 1, "method": "login", "params": [self.username, self.password]}
             logger.debug(f"HTTP POST {url} payload={_mask_dict(payload)}")
             response = session.post(url, json=payload, timeout=Config.HTTP_TIMEOUT)
@@ -319,7 +460,7 @@ class MicrohardDriver:
             pass
         # Fallback: raw ubus session login
         try:
-            url = f"http://{self.ip}/ubus"
+            url = f"{base}/ubus"
             payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -357,10 +498,11 @@ class MicrohardDriver:
         # Create session with SSL verification disabled
         session = requests.Session()
         session.verify = False
+        base = self._http_base()
         
         def do_call(token: str) -> Optional[Dict]:
             try:
-                url = f"http://{self.ip}/ubus"
+                url = f"{base}/ubus"
                 payload = {
                     "jsonrpc": "2.0",
                     "id": 2,
@@ -534,11 +676,28 @@ class MicrohardDriver:
             cfg, section, option = self.profile.uci_keys[semantic_key]
             if section.startswith("@stats[") and semantic_key.startswith("stats_"):
                 section = stats_section
-            logger.debug(f"HTTP applying mapped set {cfg}.{section}.{option}={_mask_value(str(value))}")
+            # Resolve any '@type[idx]' to concrete section id
+            if section.startswith("@"):
+                m = re.match(r"@([A-Za-z0-9_]+)\[(\d+)\]", section)
+                if m:
+                    type_ = m.group(1)
+                    idx = int(m.group(2))
+                    resolved = self._resolve_section_id_http(cfg, type_, idx)
+                    if not resolved:
+                        # Create if missing
+                        new_sid = self._uci_add_http(cfg, type_)
+                        if new_sid:
+                            resolved = new_sid
+                    if not resolved:
+                        error(f"Failed to resolve UCI section for {cfg}.{section}")
+                        return False
+                    section = resolved
+            sval = str(value)
+            logger.debug(f"HTTP applying mapped set {cfg}.{section}.{option}={_mask_value(sval)}")
             result = self._ubus_call("uci", "set", {
                 "config": cfg,
                 "section": section,
-                "values": {option: value},
+                "values": {option: sval},
             })
             if not result:
                 error(f"Failed to set {cfg}.{section}.{option} via HTTP")
@@ -546,76 +705,99 @@ class MicrohardDriver:
         return True
     
     def apply_via_ssh(self) -> bool:
-        info("Applying configuration via SSH")
+        info("Applying configuration via SSH (AT CLI)")
         logger.debug(f"Using SSH credentials - username: {self.username}, password: {'*' * len(self.password)}")
-        
-        # First test SSH connectivity with a simple command
-        logger.debug("Testing SSH connectivity with 'echo test' command")
-        test_success, test_output = self._ssh_execute("echo test")
-        if not test_success:
-            error(f"SSH connection test failed: {test_output}")
-            if "Authentication failed" in test_output:
-                logger.error("SSH authentication failed. Please verify:")
-                logger.error("  - The radio password (use --microhard-pass or set MICROHARD_PASS env var)")
-                logger.error("  - Default password is 'admin' if radio is at factory settings")
-                logger.error("  - If password was changed, provide the correct password")
-            return False
-        logger.debug(f"SSH test successful: {test_output.strip()}")
-        
-        # Apply staged generic configs (system/network)
-        for config_type, sections in self.staged_config.items():
-            for section, values in sections.items():
-                for key, value in values.items():
-                    val = shlex.quote(str(value))
-                    if section.startswith('@'):
-                        cmd = f"uci set {config_type}.{section}.{key}={val}"
-                    else:
-                        cmd = f"uci set {config_type}.{section}.{key}={val}"
-                    logger.debug(f"SSH applying set: {_mask_cmd(cmd)}")
-                    success_flag, output = self._ssh_execute(cmd)
-                    if not success_flag:
-                        error(f"Failed to set {key}: {output}")
-                        return False
-        # Apply radio params and stats via profile mapping
-        if self._radio_params:
-            if not self._apply_profile_sets_ssh({
-                'role': self._radio_params.get('role'),
-                'freq_mhz': self._radio_params.get('freq_mhz'),
-                'bw_mhz': self._radio_params.get('bw_mhz'),
-                'net_id': self._radio_params.get('net_id'),
-                'aes_key': self._radio_params.get('aes_key'),
-                'tx_power': self._radio_params.get('tx_power'),
-                'encrypt_enable': self._radio_params.get('encrypt_enable'),
-            }):
-                return False
-        if self._stats_params:
-            if not self._apply_profile_sets_ssh({
-                'stats_enable': self._stats_params.get('enable'),
-                'stats_port': self._stats_params.get('port'),
-                'stats_interval': self._stats_params.get('interval'),
-                'stats_fields': self._stats_params.get('fields'),
-            }):
-                return False
 
-        # Commit configs written above
-        for config_type in self.staged_config.keys():
-            cmd = f"uci commit {config_type}"
-            logger.debug(f"SSH commit: {cmd}")
-            success_flag, output = self._ssh_execute(cmd)
-            if not success_flag:
-                error(f"Failed to commit {config_type}: {output}")
-                return False
-        # Also commit Microhard-specific configs if profile detected
-        if self.profile:
-            commit_targets = {cfg for (_, (cfg, _, _)) in self.profile.uci_keys.items()}
-            for cfg in commit_targets:
-                logger.debug(f"SSH commit: uci commit {cfg}")
-                success_flag, output = self._ssh_execute(f"uci commit {cfg}")
-                if not success_flag:
-                    error(f"Failed to commit {cfg}: {output}")
-                    return False
-        
-        success("Configuration committed via SSH")
+        # Build AT command sequence from staged params
+        at_cmds: list[str] = []
+
+        # System: hostname; description is WebUI-only per manual (skip with warning)
+        try:
+            hostname = self.staged_config.get('system', {}).get('@system[0]', {}).get('hostname')
+            if hostname:
+                at_cmds.append(f"AT+MSMNAME={hostname}")
+            if self.staged_config.get('system', {}).get('@system[0]', {}).get('description'):
+                warning("System description is not supported via AT; skipping")
+        except Exception:
+            pass
+
+        # Wireless radio settings
+        if self._radio_params:
+            # Role: Master=0, Slave=1
+            role = str(self._radio_params.get('role') or '').strip()
+            mode_val = 0 if role.lower() == 'master' else 1
+            at_cmds.append(f"AT+MWVMODE={mode_val}")
+
+            # Frequency MHz
+            try:
+                freq = int(self._radio_params.get('freq_mhz'))
+                at_cmds.append(f"AT+MWFREQ={freq}")
+            except Exception:
+                warning("Invalid frequency in staged params; skipping")
+
+            # Bandwidth mapping: 5 MHz -> 0 (manual reference)
+            try:
+                bw = int(self._radio_params.get('bw_mhz'))
+                bw_code_map = {5: 0, 10: 1, 20: 2, 40: 3}
+                bw_code = bw_code_map.get(bw)
+                if bw_code is None:
+                    warning(f"Unsupported bandwidth {bw} MHz; using 5 MHz (code 0)")
+                    bw_code = 0
+                at_cmds.append(f"AT+MWBAND={bw_code}")
+            except Exception:
+                warning("Invalid bandwidth in staged params; skipping")
+
+            # Network ID
+            net_id = self._radio_params.get('net_id')
+            if net_id:
+                at_cmds.append(f"AT+MWNETWORKID={net_id}")
+
+            # TX Power
+            try:
+                txp = int(self._radio_params.get('tx_power'))
+                at_cmds.append(f"AT+MWTXPOWER={txp}")
+            except Exception:
+                warning("Invalid tx_power in staged params; skipping")
+
+            # Encryption: AES-128 per manual; disable when encrypt_enable != '1'
+            encrypt_enable = str(self._radio_params.get('encrypt_enable') or '0').strip()
+            aes_key = self._radio_params.get('aes_key')
+            if encrypt_enable == '1' and aes_key:
+                # Manual indicates MWVENCRYPT requires type + key; use type 1 for AES-128
+                at_cmds.append(f"AT+MWVENCRYPT=1,{aes_key}")
+            else:
+                at_cmds.append("AT+MWVENCRYPT=0")
+
+        # Network interface: switch LAN to DHCP client when requested
+        try:
+            if self.staged_config.get('network', {}).get('lan', {}).get('proto') == 'dhcp':
+                at_cmds.append("AT+MNIFACE=lan,EDIT,0")
+        except Exception:
+            pass
+
+        # Radio Stats stream
+        if self._stats_params:
+            try:
+                enabled = str(self._stats_params.get('enable') or '0')
+                port = int(self._stats_params.get('port') or 22222)
+                interval = int(self._stats_params.get('interval') or 1000)
+                if enabled == '1':
+                    # Per manual, configure enable + port + interval; server IP is external
+                    at_cmds.append(f"AT+MRFRPT=1,{port},{interval}")
+                else:
+                    at_cmds.append("AT+MRFRPT=0")
+            except Exception:
+                warning("Invalid stats params; skipping AT+MRFRPT")
+
+        # Save once at end
+        at_cmds.append("AT&W")
+
+        ok, out = self._ssh_execute_at_session(at_cmds)
+        if not ok:
+            error(f"AT apply failed: {out[-200:] if out else out}")
+            return False
+
+        success("Configuration applied and saved via AT commands")
         return True
     
     def apply_via_http(self) -> bool:
@@ -630,7 +812,20 @@ class MicrohardDriver:
         # Apply staged generic configs (system/network)
         for config_type, sections in self.staged_config.items():
             for section, values in sections.items():
-                logger.debug(f"HTTP set {config_type}.{section} values={_mask_dict(values)}")
+                # Resolve dynamic selectors like @system[0] to concrete section ids
+                orig_section = section
+                if isinstance(section, str) and section.startswith('@'):
+                    m = re.match(r"@([A-Za-z0-9_]+)\[(\d+)\]", section)
+                    if m:
+                        type_ = m.group(1)
+                        idx = int(m.group(2))
+                        resolved = self._resolve_section_id_http(config_type, type_, idx)
+                        if not resolved:
+                            new_sid = self._uci_add_http(config_type, type_)
+                            if new_sid:
+                                resolved = new_sid
+                        section = resolved or section
+                logger.debug(f"HTTP set {config_type}.{section} values={_mask_dict(values)} (from {orig_section})")
                 result = self._ubus_call("uci", "set", {
                     "config": config_type,
                     "section": section,
@@ -906,36 +1101,30 @@ class MicrohardDriver:
             return False
     
     def change_password(self, new_password: str) -> bool:
-        """Change the device password to the target password."""
-        info(f"Changing device password")
-        logger.debug(f"Changing password from current to: {'*' * len(new_password)}")
-        
-        # Use echo to pipe password to passwd command (BusyBox style)
-        # Note: Different systems may need different approaches
-        cmd = f"(echo '{new_password}'; echo '{new_password}') | passwd"
-        success_flag, output = self._ssh_execute(cmd)
-        
-        if success_flag and ("password updated successfully" in output.lower() or 
-                             "password changed" in output.lower() or
-                             len(output.strip()) == 0):  # Sometimes no output means success
-            success("Password changed successfully")
-            self.password = new_password  # Update the driver's password
-            return True
-        
-        # Try alternative method
-        logger.debug("First password change method didn't work, trying alternative")
-        cmd = f"echo -e '{new_password}\\n{new_password}' | passwd"
-        success_flag, output = self._ssh_execute(cmd)
-        
-        if success_flag and ("password updated successfully" in output.lower() or 
-                             "password changed" in output.lower() or
-                             len(output.strip()) == 0):
-            success("Password changed successfully (alternative method)")
+        """Change the device password using the Microhard AT CLI over SSH.
+
+        Replaces prior shell/uci attempts. Sends MSPWD followed by a single
+        save with AT&W.
+        """
+        info("Changing device password via AT CLI")
+        logger.debug(f"Changing password to length {len(new_password)} (value masked)")
+
+        # Per manual: AT+MSPWD=<new>,<confirm>
+        cmds = [
+            f"AT+MSPWD={new_password},{new_password}",
+            "AT&W",
+        ]
+        ok, out = self._ssh_execute_at_session(cmds)
+        if ok:
+            success("Password changed and saved")
             self.password = new_password
+            # Give device a moment to flush NVRAM
+            time.sleep(2)
             return True
-        
-        warning(f"Could not change password via SSH. Output: {output[:200]}")
-        return False
+        else:
+            error("Password change failed via AT CLI")
+            logger.debug(f"AT password change output: {out[-200:] if out else out}")
+            return False
     
     def provision(self, config: RadioConfig) -> bool:
         try:
@@ -945,8 +1134,21 @@ class MicrohardDriver:
             # If we're using factory default password, change it to target password
             if self.password == Config.DEFAULT_MICROHARD_PASS and Config.TARGET_MICROHARD_PASS != Config.DEFAULT_MICROHARD_PASS:
                 info("Detected factory default password, changing to deployment password")
+                old_password = self.password
                 if self.change_password(Config.TARGET_MICROHARD_PASS):
                     success("Password updated to deployment standard")
+                    # Smoke test: verify new password works for SSH; retry with increasing delay
+                    for attempt in range(3):
+                        if attempt > 0:
+                            time.sleep(2.0 * attempt)  # Increasing delay: 0s, 2s, 4s
+                        ok, _ = self._ssh_execute("echo ok")
+                        if ok:
+                            break
+                    else:
+                        error("Re-login with new password failed; aborting to avoid lockout")
+                        # Restore old password in driver state so operator can retry
+                        self.password = old_password
+                        return False
                 else:
                     warning("Could not change password, continuing with factory default")
             

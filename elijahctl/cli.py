@@ -21,7 +21,7 @@ from .utils.logging import (
     setup_logging, info, success, error, warning, 
     confirm, print_dict
 )
-from .utils.network import discover_services, find_mac_in_leases
+from .utils.network import discover_services, find_mac_in_leases, ip_on_local_network, get_interface_info
 from .drivers.mh_profile import detect_profile
 
 @click.group()
@@ -36,6 +36,12 @@ def cli(verbose: bool, log_file: Optional[str]):
 @click.option('--ip', default=Config.DEFAULT_MICROHARD_IP, help='Radio IP address')
 def discover(ip: str):
     info(f"Discovering services at {ip}")
+    if not ip_on_local_network(ip):
+        warning("Target IP is not within any local interface network")
+        info("Ensure your host has an interface on the same subnet (e.g., 192.168.168.0/24)")
+        iface_info = get_interface_info()
+        if iface_info:
+            print_dict(iface_info, "Local Interfaces")
     services = discover_services(ip, 2.0)
     print_dict(services, "Available Services")
 
@@ -91,7 +97,7 @@ def provision(role: str, drone_id: Optional[str], sysid: Optional[int],
     # Add debug logging for password
     logger = logging.getLogger(__name__)
     logger.debug(f"Creating MicrohardDriver with IP={ip}, user={Config.DEFAULT_MICROHARD_USER}, pass={'*' * len(microhard_pass) if microhard_pass else 'None'}")
-    logger.debug(f"Password provided: '{microhard_pass}', length={len(microhard_pass) if microhard_pass else 0}")
+    logger.debug(f"Password provided (length={len(microhard_pass) if microhard_pass else 0}), value masked")
     
     driver = MicrohardDriver(ip, Config.DEFAULT_MICROHARD_USER, microhard_pass)
     

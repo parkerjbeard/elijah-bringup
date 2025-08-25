@@ -118,30 +118,15 @@ class TestMicrohardDriver:
         assert driver._freq_to_channel(2462) == 11
         assert driver._freq_to_channel(9999) == 4
     
-    @patch.object(MicrohardDriver, '_ssh_execute')
-    def test_apply_via_ssh(self, mock_ssh_execute, driver, air_config):
-        mock_ssh_execute.return_value = (True, "success")
-        # Provide a detected profile so radio params/stats can be applied
-        driver.profile = MHProfile(
-            name="mh_radio_v1",
-            uci_keys={
-                "role": ("mh_radio", "@mh[0]", "mode"),
-                "freq_mhz": ("mh_radio", "@mh[0]", "freq_mhz"),
-                "bw_mhz": ("mh_radio", "@mh[0]", "bw_mhz"),
-                "net_id": ("mh_radio", "@mh[0]", "net_id"),
-                "aes_key": ("mh_radio", "@mh[0]", "aes_key"),
-                "stats_enable": ("mh_stats", "@stats[0]", "enable"),
-                "stats_port": ("mh_stats", "@stats[0]", "port"),
-                "stats_interval": ("mh_stats", "@stats[0]", "interval"),
-                "stats_fields": ("mh_stats", "@stats[0]", "fields"),
-            },
-        )
+    @patch.object(MicrohardDriver, '_ssh_execute_at_session')
+    def test_apply_via_ssh(self, mock_at_session, driver, air_config):
+        mock_at_session.return_value = (True, "OK")
 
         driver.stage_config(air_config)
         result = driver.apply_via_ssh()
         
         assert result is True
-        assert mock_ssh_execute.call_count > 0
+        assert mock_at_session.call_count == 1
     
     @patch.object(MicrohardDriver, '_ubus_call')
     @patch.object(MicrohardDriver, '_ubus_login')
