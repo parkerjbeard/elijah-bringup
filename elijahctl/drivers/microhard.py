@@ -575,7 +575,9 @@ class MicrohardDriver:
                 port = int(self._stats_params.get('port') or 22222)
                 interval = int(self._stats_params.get('interval') or 1000)
                 if enabled == '1':
-                    at_cmds.append(f"AT+MRFRPT=1,{port},{interval}")
+                    # Per docs: Status, Server IP, Port, Interval, RF flag, Network flag
+                    # Using radio's own IP as placeholder - Jetson service will configure actual destination
+                    at_cmds.append(f"AT+MRFRPT=1,{self.ip},{port},{interval},1,1")
                 else:
                     at_cmds.append("AT+MRFRPT=0")
             except Exception:
