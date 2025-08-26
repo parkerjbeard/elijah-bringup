@@ -46,6 +46,15 @@ class JetsonDriver:
             cmd += ["--ask-pass", "--ask-become-pass"]
         
         try:
+            # Ensure Ansible uses our repo config (pipelining + mux)
+            env = os.environ.copy()
+            repo_root = Path(__file__).resolve().parents[2]
+            cfg_path = repo_root / "ansible.cfg"
+            if cfg_path.exists():
+                env["ANSIBLE_CONFIG"] = str(cfg_path)
+            env.setdefault("ANSIBLE_HOST_KEY_CHECKING", "False")
+            # Prefer multiplexing even when sshpass is present
+            env.setdefault("ANSIBLE_SSH_ARGS", "-o ControlMaster=auto -o ControlPersist=60s -o ServerAliveInterval=15 -o ServerAliveCountMax=2")
             with create_progress() as progress:
                 task = progress.add_task("Running Ansible playbook...", total=None)
                 
@@ -54,7 +63,8 @@ class JetsonDriver:
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True
+                    text=True,
+                    env=env,
                 )
                 
                 if "--ask-pass" in cmd:
@@ -127,30 +137,45 @@ class JetsonDriver:
             return True
         
         info(f"Uploading firmware to {self.config.device_name}")
-        
+        dest_dir = f"/home/{self.config.ansible_user}/firmware/"
+        remote = f"{self.config.ansible_user}@{self.config.ansible_host}:{dest_dir}"
+
+        # Ensure destination directory exists (one-time SSH with mux)
+        ssh_base = [
+            "ssh",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=60s",
+            "-o", "StrictHostKeyChecking=no",
+        ]
         try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(
-                self.config.ansible_host,
-                username=self.config.ansible_user,
-                password="jetson",
-                timeout=Config.SSH_TIMEOUT,
-                allow_agent=False,
-                look_for_keys=False
-            )
-            
-            sftp = client.open_sftp()
-            
-            remote_path = f"/home/jetson/firmware/{firmware_path.name}"
-            sftp.put(str(firmware_path), remote_path)
-            
-            sftp.close()
-            client.close()
-            
-            success(f"Firmware uploaded: {remote_path}")
-            return True
-            
+            subprocess.run(ssh_base + [f"{self.config.ansible_user}@{self.config.ansible_host}", "mkdir -p", dest_dir], check=False)
+        except Exception:
+            pass
+
+        try:
+            if shutil.which("rsync"):
+                cmd = [
+                    "rsync", "-azP",
+                    "-e", " ".join(ssh_base),
+                    str(firmware_path),
+                    remote,
+                ]
+            else:
+                cmd = [
+                    "scp", "-C",
+                    "-o", "ControlMaster=auto",
+                    "-o", "ControlPersist=60s",
+                    "-o", "StrictHostKeyChecking=no",
+                    str(firmware_path),
+                    remote,
+                ]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0:
+                success(f"Firmware uploaded: {dest_dir}{firmware_path.name}")
+                return True
+            else:
+                logger.error(f"Upload failed: {r.stderr}")
+                return False
         except Exception as e:
             error(f"Failed to upload firmware: {e}")
             return False

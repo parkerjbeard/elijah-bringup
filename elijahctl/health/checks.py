@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 from datetime import datetime
 import paramiko
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from ..config import Config, HealthCheckResult
 from ..drivers.mavlink import MAVLinkDriver
@@ -227,7 +228,7 @@ class HealthCheck:
                 try:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     sock.bind(("0.0.0.0", port))
-                    sock.settimeout(5)
+                    sock.settimeout(Config.HEALTH_CHECK_TIMEOUT)
                     data, addr = sock.recvfrom(4096)
                     if data:
                         return self._add_result(
@@ -253,13 +254,13 @@ class HealthCheck:
                 host = url.hostname or self.jetson_host
                 port = url.port or 554
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(5)
+                s.settimeout(Config.HEALTH_CHECK_TIMEOUT)
                 rc = s.connect_ex((host, port))
                 if rc == 0:
                     try:
                         req = f"OPTIONS {spec} RTSP/1.0\r\nCSeq: 1\r\n\r\n".encode()
                         s.sendall(req)
-                        s.settimeout(3)
+                        s.settimeout(Config.HEALTH_CHECK_TIMEOUT)
                         data = s.recv(1024)
                         s.close()
                         text = data.decode(errors="ignore") if data else ""
@@ -297,10 +298,10 @@ class HealthCheck:
                 except Exception:
                     port = 5600
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(5)
+                s.settimeout(Config.HEALTH_CHECK_TIMEOUT)
                 rc = s.connect_ex((self.jetson_host, port))
                 if rc == 0:
-                    s.settimeout(2)
+                    s.settimeout(Config.HEALTH_CHECK_TIMEOUT)
                     try:
                         data = s.recv(1024)
                         s.close()
@@ -432,36 +433,24 @@ class HealthCheck:
         except Exception:
             pass
         self.results = []
-        
-        with create_progress() as progress:
-            task = progress.add_task("Running health checks...", total=7)
-            
-            self.check_connectivity()
-            progress.advance(task)
-            
-            self.check_tailscale()
-            progress.advance(task)
-            
-            self.check_radio_stats(timeout=Config.HEALTH_CHECK_TIMEOUT)
-            progress.advance(task)
-            
-            self.check_mavlink()
-            progress.advance(task)
-            
-            self.check_video_stream()
-            progress.advance(task)
-            
-            self.check_pth_sensors()
-            progress.advance(task)
-            
-            self.check_versions()
-            progress.advance(task)
-        
+
+        funcs = [
+            self.check_connectivity,
+            self.check_tailscale,
+            lambda: self.check_radio_stats(timeout=Config.HEALTH_CHECK_TIMEOUT),
+            self.check_mavlink,
+            self.check_video_stream,
+            self.check_pth_sensors,
+            self.check_versions,
+        ]
+
+        # Run in parallel to reduce wall time
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(lambda f: f(), funcs))
+
         passed = sum(1 for r in self.results if r.status)
         total = len(self.results)
-        
         info(f"\nHealth check summary: {passed}/{total} passed")
-        
         return self.results
     
     def save_results(self, filepath: Optional[str] = None) -> str:
