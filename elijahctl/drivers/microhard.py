@@ -415,12 +415,29 @@ class MicrohardDriver:
                 ok, resp = send_and_wait(cmd)
                 agg_out += resp
                 if not ok:
-                    warning(f"AT command failed or timed out: {cmd}")
-                    try:
-                        chan.close()
-                    finally:
-                        client.close()
-                    return False, agg_out.strip()
+                    # Special handling for optional commands that may not be supported
+                    if "MWTXPOWER" in cmd or "MWTXPOWERQ" in cmd:
+                        warning(f"TX Power command not supported on this model, continuing...")
+                        continue
+                    elif cmd.strip().upper() == "AT&W":
+                        # AT&W might not return OK but still save successfully
+                        if "restarting" in resp.lower() or not chan.active:
+                            info("Configuration saved (radio restarting)")
+                            ok = True
+                        else:
+                            warning(f"AT command failed or timed out: {cmd}")
+                            try:
+                                chan.close()
+                            finally:
+                                client.close()
+                            return False, agg_out.strip()
+                    else:
+                        warning(f"AT command failed or timed out: {cmd}")
+                        try:
+                            chan.close()
+                        finally:
+                            client.close()
+                        return False, agg_out.strip()
 
             # All commands OK; close channel and return
             try:
@@ -557,10 +574,11 @@ class MicrohardDriver:
             net_id = self._radio_params.get('net_id')
             if net_id:
                 at_cmds.append(f"AT+MWNETWORKID={net_id}")
+            # TX power using the correct command for this model
             try:
                 txp = int(self._radio_params.get('tx_power'))
-                warning(f"Skipping TX power setting (value: {txp}) - command not supported on this model")
-                # at_cmds.append(f"AT+MWTXPOWER={txp}")
+                # Use AT+MWTXPOWERQ with save flag (1 = save permanently)
+                at_cmds.append(f"AT+MWTXPOWERQ={txp},1")
             except Exception:
                 warning("Invalid tx_power in staged params; skipping")
             encrypt_enable = str(self._radio_params.get('encrypt_enable') or '0').strip()
@@ -575,20 +593,8 @@ class MicrohardDriver:
                 at_cmds.append("AT+MNIFACE=lan,EDIT,0")
         except Exception:
             pass
-        # Stats
-        if self._stats_params:
-            try:
-                enabled = str(self._stats_params.get('enable') or '0')
-                port = int(self._stats_params.get('port') or 22222)
-                interval = int(self._stats_params.get('interval') or 1000)
-                if enabled == '1':
-                    # Per docs: Status, Server IP, Port, Interval, RF flag, Network flag
-                    # Using radio's own IP as placeholder - Jetson service will configure actual destination
-                    at_cmds.append(f"AT+MRFRPT=1,{self.ip},{port},{interval},1,1")
-                else:
-                    at_cmds.append("AT+MRFRPT=0")
-            except Exception:
-                warning("Invalid stats params; skipping AT+MRFRPT")
+        # NOTE: Stats configuration removed - handled via UCI commands for granular control
+        
         # Save
         at_cmds.append("AT&W")
         return at_cmds
@@ -868,18 +874,164 @@ class MicrohardDriver:
                 return False
         return True
     
-    def apply_via_ssh(self) -> bool:
-        info("Applying configuration via SSH (AT CLI)")
-        logger.debug(f"Using SSH credentials - username: {self.username}, password: {'*' * len(self.password)}")
-        # Build AT command sequence from staged params
-        at_cmds = self._build_at_commands_from_staged()
+    def _uci_has_config_ssh(self, cfg: str) -> bool:
+        """Check if a UCI config file exists on the device."""
+        ok, _ = self._ssh_execute(f"[ -f /etc/config/{shlex.quote(cfg)} ]")
+        return ok
 
-        ok, out = self._ssh_execute_at_session(at_cmds)
-        if not ok:
-            error(f"AT apply failed: {out[-200:] if out else out}")
+    def _restart_stats_daemon_ssh(self) -> None:
+        """Restart the appropriate stats daemon service."""
+        for cmd in (
+            "[ -x /etc/init.d/udpReport ] && /etc/init.d/udpReport restart || true",
+            "[ -x /etc/init.d/udpReportd ] && /etc/init.d/udpReportd restart || true",
+            "[ -x /etc/init.d/mh_stats ] && /etc/init.d/mh_stats restart || true",
+        ):
+            self._ssh_execute(cmd)
+
+    def _apply_stats_via_uci_ssh(self) -> bool:
+        """Apply stats configuration via UCI commands over SSH."""
+        try:
+            # Prefer the LuCI-backed udpReport if present on this firmware
+            if self._uci_has_config_ssh("udpReport"):
+                info("Detected udpReport config - using LuCI-compatible configuration")
+                enable = '1' if str(self._stats_params.get('enable', '1')) in ('1', 'true', 'on') else '0'
+                serverip = str(self._stats_params.get('server_ip') or self.ip)
+                port = str(self._stats_params.get('port') or 20200)
+                interval = str(self._stats_params.get('interval') or 60000)  # ms
+
+                cmds = [
+                    f"uci set udpReport.general.enable={shlex.quote(enable)}",
+                    f"uci set udpReport.general.serverip={shlex.quote(serverip)}",
+                    f"uci set udpReport.general.serverport={shlex.quote(port)}",
+                    f"uci set udpReport.general.interval={shlex.quote(interval)}",
+                    "uci set udpReport.general.itemRf=1",
+                    "uci set udpReport.general.itemEPIP=1",  # Associated IP
+                    "uci commit udpReport",
+                ]
+                for c in cmds:
+                    ok, out = self._ssh_execute(c)
+                    if not ok:
+                        error(f"Failed: {c} -> {out}")
+                        return False
+
+                self._restart_stats_daemon_ssh()
+                success("Radio stats configured via udpReport with Associated IP enabled")
+                return True
+
+            # Fall back to existing mh_stats flow
+            info("Using mh_stats configuration (udpReport not found)")
+            enable = str(self._stats_params.get('enable') or '0')
+            ok, out = self._ssh_execute(f"uci set mh_stats.@stats[0].enable={enable}")
+            if not ok:
+                error(f"Failed to set stats enable: {out}")
+                return False
+            
+            if enable == '1':
+                # Set port
+                port = str(self._stats_params.get('port') or 22222)
+                ok, out = self._ssh_execute(f"uci set mh_stats.@stats[0].port={port}")
+                if not ok:
+                    error(f"Failed to set stats port: {out}")
+                    return False
+                
+                # Set interval
+                interval = str(self._stats_params.get('interval') or 1000)
+                ok, out = self._ssh_execute(f"uci set mh_stats.@stats[0].interval={interval}")
+                if not ok:
+                    error(f"Failed to set stats interval: {out}")
+                    return False
+                
+                # Set fields (including associated_ip)
+                fields = self._stats_params.get('fields', 'rf,rssi,snr,associated_ip')
+                ok, out = self._ssh_execute(f"uci set mh_stats.@stats[0].fields='{fields}'")
+                if not ok:
+                    error(f"Failed to set stats fields: {out}")
+                    return False
+                
+                # Set server IP (using radio's own IP as placeholder)
+                ok, out = self._ssh_execute(f"uci set mh_stats.@stats[0].server_ip={self.ip}")
+                if not ok:
+                    error(f"Failed to set stats server IP: {out}")
+                    return False
+            
+            # Commit the changes
+            ok, out = self._ssh_execute("uci commit mh_stats")
+            if not ok:
+                error(f"Failed to commit mh_stats: {out}")
+                return False
+            
+            self._restart_stats_daemon_ssh()
+            
+            return True
+            
+        except Exception as e:
+            error(f"Failed to apply stats via UCI: {e}")
             return False
 
-        success("Configuration applied and saved via AT commands")
+    def apply_via_ssh(self) -> bool:
+        info("Applying configuration via hybrid SSH (AT+UCI)")
+        logger.debug(f"Using SSH credentials - username: {self.username}, password: {'*' * len(self.password)}")
+
+        # Step 1: Apply fundamental settings via AT commands
+        at_cmds = self._build_at_commands_from_staged()
+        ok, out = self._ssh_execute_at_session(at_cmds)
+        if not ok:
+            error(f"AT command portion failed: {out[-200:] if out else out}")
+            return False
+        success("Core radio parameters applied via AT commands")
+
+        # Step 2: Apply granular stats configuration via UCI commands over SSH
+        if self._stats_params:
+            # Wait for radio to be ready after AT&W restart
+            info("Waiting for radio to restart after configuration save...")
+            
+            # Wait for radio to come back online with active polling
+            import socket
+            max_wait = 60  # seconds total
+            poll_interval = 3  # seconds between checks
+            start_time = time.time()
+            
+            while time.time() - start_time < max_wait:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1)
+                    result = sock.connect_ex((self.ip, 22))
+                    sock.close()
+                    
+                    if result == 0:
+                        success(f"Radio SSH service is back online (took {int(time.time() - start_time)}s)")
+                        time.sleep(2)  # Give it a moment to fully initialize
+                        break
+                except Exception:
+                    pass
+                
+                elapsed = int(time.time() - start_time)
+                if elapsed % 10 == 0 and elapsed > 0:
+                    info(f"Still waiting for radio... ({elapsed}s elapsed)")
+                time.sleep(poll_interval)
+            else:
+                warning(f"Radio did not respond after {max_wait}s, attempting to continue anyway")
+            
+            info("Applying radio stats configuration via UCI over SSH")
+            
+            # Apply stats settings via UCI with retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    if self._apply_stats_via_uci_ssh():
+                        success("Radio stats configuration applied and committed")
+                        return True
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        warning(f"UCI config attempt {attempt + 1} failed: {e}, retrying...")
+                        time.sleep(3)
+                    else:
+                        error(f"Failed to apply radio stats via UCI after {max_retries} attempts: {e}")
+                        return False
+            
+            error("Failed to apply radio stats via UCI over SSH")
+            return False
+
         return True
     
     def apply_via_http(self) -> bool:
