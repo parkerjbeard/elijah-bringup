@@ -23,7 +23,7 @@ logger = get_logger(__name__)
 
 def _ensure_session_dir(ip: str, label: Optional[str] = None) -> Path:
     ts = time.strftime("%Y%m%d-%H%M%S")
-    base = Config.STATE_DIR / "testing" / "microhard" / f"{ts}-{ip}"
+    base = Config.STATE_DIR / "diagnostics" / "microhard" / f"{ts}-{ip}"
     if label:
         base = base.with_name(f"{ts}-{ip}-{label}")
     base.mkdir(parents=True, exist_ok=True)

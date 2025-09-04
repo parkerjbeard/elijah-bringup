@@ -36,6 +36,8 @@ class RadioConfig:
     radio_stats_enabled: bool = True
     radio_stats_port: int = 22222
     radio_stats_interval: int = 1000
+    # Optional: explicit receiver IP for stats UDP sink
+    radio_stats_server_ip: Optional[str] = None
 
     def __post_init__(self):
         if self.role == RadioRole.AIR:

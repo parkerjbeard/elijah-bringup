@@ -14,7 +14,7 @@ from .drivers.jetson import JetsonDriver
 from .drivers.mavlink import MAVLinkDriver
 from .drivers.mh_profile import detect_profile
 from .drivers.microhard import MicrohardDriver
-from .testing.microhard_testing import (
+from .diagnostics.microhard_diag import (
     run_full_probe,
     dump_atl,
     brute_force_probe,
@@ -650,15 +650,15 @@ def remoteid_check_deps(mavproxy_path: str | None, private_key: str | None, forc
 
 @cli.group()
 def microhard():
-    """Microhard-specific utilities and testing."""
+    """Microhard-specific utilities and diagnostics."""
 
 
-@microhard.group()
-def testing():
-    """Empirical tests to probe AT commands and stats."""
+@microhard.group(name="diag")
+def diagnostics():
+    """Diagnostics to probe AT commands and stats."""
 
 
-@testing.command("run")
+@diagnostics.command("run")
 @click.option("--ip", default=Config.DEFAULT_MICROHARD_IP, help="Radio IP address")
 @click.option("--microhard-pass", envvar="MICROHARD_PASS", default="admin", help="Radio password")
 @click.option("--duration", default=10, help="UDP capture duration (seconds)")
@@ -674,14 +674,14 @@ def microhard_testing_run(ip: str, microhard_pass: str, duration: int, server_ip
     success(f"Testing session complete: {session_dir}")
 
 
-@testing.command("atl")
+@diagnostics.command("atl")
 @click.option("--ip", default=Config.DEFAULT_MICROHARD_IP, help="Radio IP address")
 @click.option("--microhard-pass", envvar="MICROHARD_PASS", default="admin", help="Radio password")
 def microhard_testing_atl(ip: str, microhard_pass: str):
     """Dump ATL (list AT commands) to a session directory and print a summary."""
     driver = MicrohardDriver(ip, Config.DEFAULT_MICROHARD_USER, microhard_pass)
     driver.discover()
-    from .testing.microhard_testing import _ensure_session_dir  # local import to avoid export
+    from .diagnostics.microhard_diag import _ensure_session_dir  # local import to avoid export
     sess = _ensure_session_dir(ip, label="atl")
     ok, out = dump_atl(driver, sess)
     if ok:
@@ -690,20 +690,20 @@ def microhard_testing_atl(ip: str, microhard_pass: str):
         error("ATL failed or returned no output")
 
 
-@testing.command("brute")
+@diagnostics.command("brute")
 @click.option("--ip", default=Config.DEFAULT_MICROHARD_IP, help="Radio IP address")
 @click.option("--microhard-pass", envvar="MICROHARD_PASS", default="admin", help="Radio password")
 def microhard_testing_bruteforce(ip: str, microhard_pass: str):
     """Try a small set of undocumented MRFRPT tokens and log responses."""
     driver = MicrohardDriver(ip, Config.DEFAULT_MICROHARD_USER, microhard_pass)
     driver.discover()
-    from .testing.microhard_testing import _ensure_session_dir
+    from .diagnostics.microhard_diag import _ensure_session_dir 
     sess = _ensure_session_dir(ip, label="brute")
     brute_force_probe(driver, sess)
     success(f"Brute-force results saved to {sess / 'brute_force.txt'}")
 
 
-@testing.command("capture")
+@diagnostics.command("capture")
 @click.option("--ip", default=Config.DEFAULT_MICROHARD_IP, help="Radio IP address")
 @click.option("--microhard-pass", envvar="MICROHARD_PASS", default="admin", help="Radio password")
 @click.option("--server-ip", help="Host IP to receive UDP (defaults to iface on radio subnet)")
@@ -715,14 +715,14 @@ def microhard_testing_capture(ip: str, microhard_pass: str, server_ip: str | Non
     """Enable MRFRPT, capture UDP JSON to files; optionally guide a before/after toggle."""
     driver = MicrohardDriver(ip, Config.DEFAULT_MICROHARD_USER, microhard_pass)
     driver.discover()
-    from .testing.microhard_testing import _ensure_session_dir
+    from .diagnostics.microhard_diag import _ensure_session_dir
     sess = _ensure_session_dir(ip, label="capture")
 
     # Configure MRFRPT to this host
     host_ip = server_ip
     if not host_ip:
         # Best-effort choice handled in helper inside run_full_probe path
-        from .testing.microhard_testing import _choose_server_ip_for_radio
+        from .diagnostics.microhard_diag import _choose_server_ip_for_radio
         host_ip = _choose_server_ip_for_radio(ip)
     if not host_ip:
         error("Unable to determine --server-ip; specify it explicitly")
@@ -749,7 +749,7 @@ def microhard_testing_capture(ip: str, microhard_pass: str, server_ip: str | Non
     success(f"UDP capture complete: {sess}")
 
 
-@testing.command("backup")
+@diagnostics.command("backup")
 @click.option("--ip", default=Config.DEFAULT_MICROHARD_IP, help="Radio IP address")
 @click.option("--microhard-pass", envvar="MICROHARD_PASS", default="admin", help="Radio password")
 @click.option("--label", default="backup", help="Label for backup file name")
@@ -757,7 +757,7 @@ def microhard_testing_backup(ip: str, microhard_pass: str, label: str):
     """Fetch a config backup tarball via SSH and save locally."""
     driver = MicrohardDriver(ip, Config.DEFAULT_MICROHARD_USER, microhard_pass)
     driver.discover()
-    from .testing.microhard_testing import _ensure_session_dir
+    from .diagnostics.microhard_diag import _ensure_session_dir
     sess = _ensure_session_dir(ip, label="backup")
     out = backup_config_via_ssh(driver, sess, label=label)
     if out:
@@ -767,7 +767,7 @@ def microhard_testing_backup(ip: str, microhard_pass: str, label: str):
         sys.exit(1)
 
 
-@testing.command("diff")
+@diagnostics.command("diff")
 @click.argument("a", type=click.Path(exists=True))
 @click.argument("b", type=click.Path(exists=True))
 @click.option("--out", type=click.Path(), help="Write diff to file (default: alongside A)")

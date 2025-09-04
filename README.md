@@ -159,14 +159,14 @@ elijahctl checklist \
 | `checklist` | Document configuration state | Production tracking |
 | `set-sysid` | Configure MAV_SYS_ID parameter | Flight controller setup |
 
-## Microhard Testing
+## Microhard Diagnostics
 
 Purpose: empirically verify whether “Associated IP” is exposed via AT in rev 0.2.2t, capture UDP stats payloads before/after a UI toggle, and diff config archives to locate the UCI key the UI writes.
 
 - Quick all‑in‑one probe (ATL dump, small brute sweep, enable MRFRPT, capture UDP):
   
   ```bash
-  elijahctl microhard testing run \
+  elijahctl microhard diag run \
     --ip 192.168.168.1 \
     --microhard-pass $MICROHARD_PASS \
     --duration 10 \
@@ -177,42 +177,64 @@ Purpose: empirically verify whether “Associated IP” is exposed via AT in rev
 - List all AT commands (ATL):
   
   ```bash
-  elijahctl microhard testing atl --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS
+  elijahctl microhard diag atl --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS
   ```
 
 - Brute‑force a few undocumented MRFRPT tokens (captures outputs):
   
   ```bash
-  elijahctl microhard testing brute --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS
+  elijahctl microhard diag brute --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS
   ```
 
 - Capture UDP JSON before/after a manual UI toggle of “Associated IP”:
   
   ```bash
   # Phase A (auto‑configures AT+MRFRPT to your host, captures 10s)
-  elijahctl microhard testing capture --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS --two-phase --duration 10
+  elijahctl microhard diag capture --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS --two-phase --duration 10
   # When prompted, toggle the Web UI “Associated IP” checkbox, then press Enter to record Phase B.
   ```
 
 - Save a config backup tarball (run before and after UI change):
   
   ```bash
-  elijahctl microhard testing backup --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS --label before
+  elijahctl microhard diag backup --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS --label before
   # Flip only “Associated IP” in the UI
-  elijahctl microhard testing backup --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS --label after
+  elijahctl microhard diag backup --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS --label after
   ```
 
 - Diff the two backups to locate the UCI key changed by the UI:
   
   ```bash
-  elijahctl microhard testing diff ~/.elijahctl/state/testing/microhard/*-192.168.168.1-backup/before.tar.gz \
-                                    ~/.elijahctl/state/testing/microhard/*-192.168.168.1-backup/after.tar.gz
+  elijahctl microhard diag diff ~/.elijahctl/state/diagnostics/microhard/*-192.168.168.1-backup/before.tar.gz \
+                                    ~/.elijahctl/state/diagnostics/microhard/*-192.168.168.1-backup/after.tar.gz
   ```
 
-Artifacts are written under `~/.elijahctl/state/testing/microhard/<timestamp>-<ip>-<label>/`, including:
+Artifacts are written under `~/.elijahctl/state/diagnostics/microhard/<timestamp>-<ip>-<label>/`, including:
 - `atl_dump.txt`, `brute_force.txt` for AT surface checks
 - `udp_before.jsonl`, `udp_after.jsonl` for payload comparison
 - `backup.tar.gz` and `*.diff.txt` for config diffs
+
+### Microhard Stats Streaming
+
+elijahctl configures radio stats in two firmware layouts and ensures the daemon restarts so telemetry begins immediately:
+
+- udpReport (LuCI-backed): sets `udpReport.general.{enable,serverip,serverport,interval}` then restarts `/etc/init.d/udpReport` (and `udpReportd` if present).
+- mh_stats: sets `mh_stats.@stats[0].{enable,server_ip,port,interval,fields}` then restarts `/etc/init.d/mh_stats`.
+
+Server IP selection (where to send UDP):
+- Uses explicit `radio_stats_server_ip` if provided by the caller.
+- Else chooses a host NIC IP on the same /24 as the radio (best effort).
+- Else falls back to `192.168.168.100`.
+
+Commit + restart on HTTP/ubus path:
+- After committing UCI over HTTP, elijahctl restarts the stats daemon.
+  - If SSH is reachable, it restarts via `/etc/init.d/... restart`.
+  - Otherwise it attempts `ubus call service restart '{"name":"<svc>"}'` for `udpReport`, `udpReportd`, and `mh_stats`.
+
+Troubleshooting “No data received”:
+- Verify the receiver is reachable and listening on the configured UDP port.
+- Ensure your host has an IP on the radio’s subnet (e.g., 192.168.168.0/24).
+- If needed, point stats explicitly to your host by providing `radio_stats_server_ip` via the API, or use `microhard diag capture --server-ip <your-host-ip>` to sanity-check traffic.
 
 ## Required Environment Configuration
 
@@ -230,6 +252,8 @@ Application data stored in `~/.elijahctl/`:
 ~/.elijahctl/
 ├── state/
 │   └── runs/             # Timestamped execution records
+│   └── diagnostics/
+│       └── microhard/    # Session artifacts from `microhard diag`
 ├── inventory/
 │   └── checklist.csv     # Production checklist ledger
 ├── logs/                 # Application logs

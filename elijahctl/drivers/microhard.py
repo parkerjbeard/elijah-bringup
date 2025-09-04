@@ -934,8 +934,35 @@ class MicrohardDriver:
                 "port": str(config.radio_stats_port),
                 "interval": str(config.radio_stats_interval),
                 "fields": "rf,rssi,snr,associated_ip",
+                "server_ip": config.radio_stats_server_ip,
             }
             logger.debug(f"Staged radio stats (semantic): port={config.radio_stats_port}")
+
+    def _determine_stats_server_ip(self) -> str:
+        """Determine the receiver IP for radio stats.
+
+        Order of preference:
+        - Explicit `server_ip` from staged params (via RadioConfig)
+        - Best-effort NIC on the host in the radio's /24 (testing helper)
+        - Fallback to a sane default (192.168.168.100)
+        """
+        try:
+            ip = self._stats_params.get("server_ip") if isinstance(self._stats_params, dict) else None
+            if ip:
+                return str(ip)
+        except Exception:
+            pass
+        # Try to choose a server IP from host interfaces matching radio subnet
+        try:
+            from ..diagnostics.microhard_diag import _choose_server_ip_for_radio  # type: ignore
+
+            chosen = _choose_server_ip_for_radio(self.ip)
+            if chosen:
+                return str(chosen)
+        except Exception:
+            pass
+        # Final fallback – conventional dev host on Microhard default subnet
+        return "192.168.168.100"
 
     def _freq_to_channel(self, freq: int) -> int:
         channel_map = {
@@ -1075,6 +1102,27 @@ class MicrohardDriver:
         ):
             self._ssh_execute(cmd)
 
+    def _restart_stats_daemon_http(self) -> bool:
+        """Best-effort restart of stats daemons via ubus service API.
+
+        Tries `service.restart` for udpReport/udpReportd/mh_stats; returns True
+        if any restart call succeeds.
+        """
+        restarted = False
+        try:
+            # Some images use udpReport, others use mh_stats
+            for svc in ("udpReport", "udpReportd", "mh_stats"):
+                try:
+                    res = self._ubus_call("service", "restart", {"name": svc})
+                    if res:
+                        info(f"HTTP: requested restart for {svc}")
+                        restarted = True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return restarted
+
     def _apply_stats_via_uci_ssh(self) -> bool:
         """Apply stats configuration via UCI commands over SSH."""
         try:
@@ -1086,7 +1134,7 @@ class MicrohardDriver:
                     if str(self._stats_params.get("enable", "1")) in ("1", "true", "on")
                     else "0"
                 )
-                serverip = str(self._stats_params.get("server_ip") or self.ip)
+                serverip = self._determine_stats_server_ip()
                 port = str(self._stats_params.get("port") or 20200)
                 interval = str(self._stats_params.get("interval") or 60000)  # ms
 
@@ -1139,8 +1187,11 @@ class MicrohardDriver:
                     error(f"Failed to set stats fields: {out}")
                     return False
 
-                # Set server IP (using radio's own IP as placeholder)
-                ok, out = self._ssh_execute(f"uci set mh_stats.@stats[0].server_ip={self.ip}")
+                # Set server IP to the remote stats receiver (not the radio)
+                serverip = self._determine_stats_server_ip()
+                ok, out = self._ssh_execute(
+                    f"uci set mh_stats.@stats[0].server_ip={shlex.quote(serverip)}"
+                )
                 if not ok:
                     error(f"Failed to set stats server IP: {out}")
                     return False
@@ -1308,6 +1359,23 @@ class MicrohardDriver:
             if not result:
                 error(f"Failed to commit {cfg}")
                 return False
+
+        # After committing via HTTP, ensure stats daemon is live
+        restarted = False
+        try:
+            if port_open(self.ip, 22, timeout=0.5):
+                info("Restarting stats daemon over SSH after HTTP commit")
+                self._restart_stats_daemon_ssh()
+                restarted = True
+            else:
+                info("Restarting stats daemon via ubus service API after commit")
+                restarted = self._restart_stats_daemon_http()
+        except Exception:
+            pass
+        if restarted:
+            success("Stats daemon restart triggered")
+        else:
+            warning("Could not confirm stats daemon restart; telemetry may be delayed until reboot")
 
         success("Configuration committed via HTTP")
         return True
