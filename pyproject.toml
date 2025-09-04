@@ -27,6 +27,7 @@ dependencies = [
     "asyncssh>=2.14.2",
     "fastapi>=0.111.0",
     "uvicorn>=0.30.0",
+    "pymonocypher==3.1.3.2",
 ]
 
 [project.optional-dependencies]
@@ -109,6 +110,10 @@ testpaths = [
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
+markers = [
+    "integration: integration-level tests",
+    "slow: slow-running tests",
+]
 
 [tool.coverage.run]
 source = ["elijahctl"]

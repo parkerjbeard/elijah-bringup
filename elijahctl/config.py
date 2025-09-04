@@ -6,15 +6,18 @@ import os
 from datetime import datetime
 from enum import Enum
 
+
 class RadioRole(Enum):
     AIR = "air"
     GROUND = "ground"
+
 
 class TaskStatus(Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
+
 
 @dataclass
 class RadioConfig:
@@ -33,7 +36,7 @@ class RadioConfig:
     radio_stats_enabled: bool = True
     radio_stats_port: int = 22222
     radio_stats_interval: int = 1000
-    
+
     def __post_init__(self):
         if self.role == RadioRole.AIR:
             self.mode = "Slave"
@@ -44,6 +47,7 @@ class RadioConfig:
             self.hostname = f"rainmaker-ground-{self.drone_id}"
             self.description = f"Rainmaker Ground Radio {self.drone_id}"
 
+
 @dataclass
 class JetsonConfig:
     drone_id: str
@@ -53,10 +57,11 @@ class JetsonConfig:
     ansible_user: str = "jetson"
     tailscale_auth_key: str = ""
     microhard_password: str = ""
-    
+
     def __post_init__(self):
         if not self.device_name:
             self.device_name = f"el-{self.drone_id}"
+
 
 @dataclass
 class UniFiConfig:
@@ -70,6 +75,7 @@ class UniFiConfig:
     disable_24ghz: bool = True
     disable_autolink: bool = True
     verify_tls: bool = False
+
 
 @dataclass
 class HitlChecklist:
@@ -93,7 +99,7 @@ class HitlChecklist:
     elrs_configured: Optional[bool]
     hitl_signed_by: str
     hitl_date: str
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "serial_qr": self.serial_qr,
@@ -115,8 +121,9 @@ class HitlChecklist:
             "arm_safety_param_ok": self.arm_safety_param_ok,
             "elrs_configured": self.elrs_configured,
             "hitl_signed_by": self.hitl_signed_by,
-            "hitl_date": self.hitl_date
+            "hitl_date": self.hitl_date,
         }
+
 
 @dataclass
 class InsituChecklist:
@@ -124,14 +131,15 @@ class InsituChecklist:
     seraph_insitu_ok: bool
     insitu_signed_by: str
     insitu_date: str
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "installed_in_vehicle": self.installed_in_vehicle,
             "seraph_insitu_ok": self.seraph_insitu_ok,
             "insitu_signed_by": self.insitu_signed_by,
-            "insitu_date": self.insitu_date
+            "insitu_date": self.insitu_date,
         }
+
 
 @dataclass
 class HealthCheckResult:
@@ -140,15 +148,16 @@ class HealthCheckResult:
     message: str
     data: Optional[Dict[str, Any]] = None
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "component": self.component,
             "status": self.status,
             "message": self.message,
             "data": self.data,
-            "timestamp": self.timestamp
+            "timestamp": self.timestamp,
         }
+
 
 class Config:
     BASE_DIR = Path.home() / ".elijahctl"
@@ -156,35 +165,40 @@ class Config:
     RUNS_DIR = STATE_DIR / "runs"
     INVENTORY_DIR = BASE_DIR / "inventory"
     LOGS_DIR = BASE_DIR / "logs"
-    
+
     DEFAULT_MICROHARD_IP = "192.168.168.1"
     DEFAULT_MICROHARD_USER = "admin"
     DEFAULT_MICROHARD_PASS = "admin"  # Factory default password
     TARGET_MICROHARD_PASS = "supercool"  # Password we set during provisioning
-    
+
     SSH_TIMEOUT = 10
     HTTP_TIMEOUT = 10
     TELNET_TIMEOUT = 5
     MAVLINK_TIMEOUT = 10
     HEALTH_CHECK_TIMEOUT = 5
-    
+
     @classmethod
     def init_directories(cls):
-        for dir_path in [cls.BASE_DIR, cls.STATE_DIR, cls.RUNS_DIR, 
-                         cls.INVENTORY_DIR, cls.LOGS_DIR]:
+        for dir_path in [
+            cls.BASE_DIR,
+            cls.STATE_DIR,
+            cls.RUNS_DIR,
+            cls.INVENTORY_DIR,
+            cls.LOGS_DIR,
+        ]:
             dir_path.mkdir(parents=True, exist_ok=True)
-    
+
     @classmethod
     def load_secrets(cls) -> Dict[str, str]:
         secrets_file = cls.BASE_DIR / "secrets.json"
         if secrets_file.exists():
-            with open(secrets_file, 'r') as f:
+            with open(secrets_file, "r") as f:
                 return json.load(f)
         return {}
-    
+
     @classmethod
     def save_secrets(cls, secrets: Dict[str, str]):
         secrets_file = cls.BASE_DIR / "secrets.json"
-        with open(secrets_file, 'w') as f:
+        with open(secrets_file, "w") as f:
             json.dump(secrets, f, indent=2)
         os.chmod(secrets_file, 0o600)

@@ -2,7 +2,6 @@
 
 Comprehensive CLI tool for automated provisioning, configuration, and validation of Elijah drone systems including air units, ground stations, and companion computers.
 
-For detailed setup procedures, refer to the [Production Setup Guide](setup.md).
 
 ## Core Capabilities
 
@@ -93,7 +92,31 @@ elijahctl set-sysid --host el-012 --sysid 12
 elijahctl health --jetson el-012 --radio-ip auto --video udp:5600
 ```
 
-### 5. Ground Station Setup
+### 5. RemoteID Configuration (db201)
+
+```bash
+# Configure single module
+elijahctl remoteid configure \
+  --uas-id EL-0123456789ABCDEF01 \
+  --uas-id-type 1 \
+  --uas-type 2 \
+  --connection udp:el-012:14550 \
+  --lock-level 1 \
+  --private-key /path/to/rid_private_key.dat
+
+# Batch configuration from CSV
+elijahctl remoteid batch \
+  --csv remoteid_batch.csv \
+  --private-key /path/to/rid_private_key.dat
+
+# Test connection
+elijahctl remoteid test-connection --connection udp:el-012:14550
+
+# Check dependencies
+elijahctl remoteid check-deps
+```
+
+### 6. Ground Station Setup
 
 ```bash
 # Ground Radio Configuration
@@ -135,6 +158,61 @@ elijahctl checklist \
 | `unifi` | Configure UniFi access point | Ground station setup |
 | `checklist` | Document configuration state | Production tracking |
 | `set-sysid` | Configure MAV_SYS_ID parameter | Flight controller setup |
+
+## Microhard Testing
+
+Purpose: empirically verify whether “Associated IP” is exposed via AT in rev 0.2.2t, capture UDP stats payloads before/after a UI toggle, and diff config archives to locate the UCI key the UI writes.
+
+- Quick all‑in‑one probe (ATL dump, small brute sweep, enable MRFRPT, capture UDP):
+  
+  ```bash
+  elijahctl microhard testing run \
+    --ip 192.168.168.1 \
+    --microhard-pass $MICROHARD_PASS \
+    --duration 10 \
+    --port 20200 \
+    --interval 1000
+  ```
+
+- List all AT commands (ATL):
+  
+  ```bash
+  elijahctl microhard testing atl --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS
+  ```
+
+- Brute‑force a few undocumented MRFRPT tokens (captures outputs):
+  
+  ```bash
+  elijahctl microhard testing brute --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS
+  ```
+
+- Capture UDP JSON before/after a manual UI toggle of “Associated IP”:
+  
+  ```bash
+  # Phase A (auto‑configures AT+MRFRPT to your host, captures 10s)
+  elijahctl microhard testing capture --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS --two-phase --duration 10
+  # When prompted, toggle the Web UI “Associated IP” checkbox, then press Enter to record Phase B.
+  ```
+
+- Save a config backup tarball (run before and after UI change):
+  
+  ```bash
+  elijahctl microhard testing backup --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS --label before
+  # Flip only “Associated IP” in the UI
+  elijahctl microhard testing backup --ip 192.168.168.1 --microhard-pass $MICROHARD_PASS --label after
+  ```
+
+- Diff the two backups to locate the UCI key changed by the UI:
+  
+  ```bash
+  elijahctl microhard testing diff ~/.elijahctl/state/testing/microhard/*-192.168.168.1-backup/before.tar.gz \
+                                    ~/.elijahctl/state/testing/microhard/*-192.168.168.1-backup/after.tar.gz
+  ```
+
+Artifacts are written under `~/.elijahctl/state/testing/microhard/<timestamp>-<ip>-<label>/`, including:
+- `atl_dump.txt`, `brute_force.txt` for AT surface checks
+- `udp_before.jsonl`, `udp_after.jsonl` for payload comparison
+- `backup.tar.gz` and `*.diff.txt` for config diffs
 
 ## Required Environment Configuration
 
@@ -190,6 +268,7 @@ elijahctl/
 │   ├── microhard.py  # Radio control
 │   ├── jetson.py     # Companion computer
 │   ├── mavlink.py    # Flight controller
+│   ├── remoteid.py   # RemoteID (db201) configuration
 │   └── unifi.py      # Network infrastructure
 ├── health/           # Validation modules
 ├── utils/            # Common utilities
@@ -213,7 +292,13 @@ Certain operations require manual intervention by design:
 1. **Antenna Installation**: Proper torque specification, RHCP/LHCP alternation
 2. **ESC Configuration**: KDEDirect on Windows with v2_standard.cfg parameter file
 3. **UniFi Adoption**: Initial trust establishment with controller
-4. **RemoteID Setup**: Module configuration and regulatory database registration
+4. **RemoteID Setup**: 
+   - BlueMark db201 module connected via CAN to flight controller
+   - Flight controller must have OpenDroneID enabled (`--enable-opendroneid`)
+   - Set FC params: `DID_ENABLE=1`, `DID_OPTIONS=1`, `DID_MAVPORT=-1`, `DID_CANDRIVER=1`
+   - Use `elijahctl remoteid` commands for Basic ID configuration via SecureCommand
+   - Requires private key matching public key on module
+   - Install monocypher: `python3 -m pip install pymonocypher==3.1.3.2`
 
 ## Troubleshooting
 ### Command not found / wrong interpreter

@@ -10,11 +10,14 @@ class MHProfile:
     # Maps semantic keys -> (uci_config, section_selector, option)
     uci_keys: Dict[str, Tuple[str, str, str]]
 
+
 def load_profile_from_file(path: Path) -> Optional[MHProfile]:
     try:
         if path.exists():
             data = json.loads(path.read_text())
-            return MHProfile(name=data["name"], uci_keys={k: tuple(v) for k, v in data["uci_keys"].items()})
+            return MHProfile(
+                name=data["name"], uci_keys={k: tuple(v) for k, v in data["uci_keys"].items()}
+            )
     except Exception:
         pass
     return None
@@ -31,6 +34,7 @@ def detect_profile(uci_show_text: str) -> Optional[MHProfile]:
 
     # First, allow operator-provided mapping (no code change deployments)
     from ..config import Config  # local import to avoid cycles
+
     custom = load_profile_from_file(Config.STATE_DIR / "mh_profile.json")
     if custom:
         return custom

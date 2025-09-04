@@ -10,6 +10,7 @@ import platform
 import os
 import json
 
+
 def port_open(host: str, port: int, timeout: float = 2.0) -> bool:
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -19,6 +20,7 @@ def port_open(host: str, port: int, timeout: float = 2.0) -> bool:
         return result == 0
     except (socket.gaierror, socket.error):
         return False
+
 
 def discover_services(ip: str = "192.168.168.1", timeout: float = 2.0) -> Dict[str, bool]:
     """Probe common Microhard services on the target IP.
@@ -31,6 +33,7 @@ def discover_services(ip: str = "192.168.168.1", timeout: float = 2.0) -> Dict[s
         "http": port_open(ip, 80, timeout),
         "https": port_open(ip, 443, timeout),
     }
+
 
 def ping_host(host: str, count: int = 3, timeout: int = 2) -> Tuple[bool, Optional[float]]:
     """Cross-platform reachability check using TCP connect RTT (no system ping).
@@ -62,6 +65,7 @@ def ping_host(host: str, count: int = 3, timeout: int = 2) -> Tuple[bool, Option
         time.sleep(0.1)
     return (ok, (sum(rtts) / len(rtts)) if rtts else None)
 
+
 def _parse_arp_cache(mac_lower: str) -> Optional[str]:
     """Parse ARP cache using available tools.
 
@@ -84,7 +88,9 @@ def _parse_arp_cache(mac_lower: str) -> Optional[str]:
             result = subprocess.run(["ip", "neigh"], capture_output=True, text=True)
             # Format: 192.168.1.1 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE
             for line in result.stdout.splitlines():
-                m = re.search(r"^(\d+\.\d+\.\d+\.\d+)\s+.*lladdr\s+([0-9a-f:]{17})", line, re.IGNORECASE)
+                m = re.search(
+                    r"^(\d+\.\d+\.\d+\.\d+)\s+.*lladdr\s+([0-9a-f:]{17})", line, re.IGNORECASE
+                )
                 if m:
                     ip, mac = m.groups()
                     if mac.lower() == mac_lower:
@@ -94,7 +100,9 @@ def _parse_arp_cache(mac_lower: str) -> Optional[str]:
     return None
 
 
-def _iter_hosts_limited(network: ipaddress.IPv4Network, seed_ip: Optional[ipaddress.IPv4Address] = None):
+def _iter_hosts_limited(
+    network: ipaddress.IPv4Network, seed_ip: Optional[ipaddress.IPv4Address] = None
+):
     """Yield host IPs to probe. For /24, yield all hosts. For larger nets, only seed /24."""
     # For large networks, constrain to the /24 that contains seed_ip (if provided)
     if network.prefixlen <= 16 and seed_ip and seed_ip in network:
@@ -113,7 +121,9 @@ def _local_networks() -> List[ipaddress.IPv4Interface]:
     try:
         # Prefer `ip -o -f inet addr show` on Linux
         if shutil.which("ip"):
-            result = subprocess.run(["ip", "-o", "-f", "inet", "addr", "show"], capture_output=True, text=True)
+            result = subprocess.run(
+                ["ip", "-o", "-f", "inet", "addr", "show"], capture_output=True, text=True
+            )
             for line in result.stdout.splitlines():
                 parts = line.split()
                 if len(parts) >= 4:
@@ -159,6 +169,7 @@ def _local_networks() -> List[ipaddress.IPv4Interface]:
     except Exception:
         pass
     return nets
+
 
 def ip_on_local_network(ip: str) -> bool:
     """Return True if `ip` is within any local interface network.
@@ -259,13 +270,15 @@ def find_mac_in_leases(mac_address: str, subnet: Optional[str] = None) -> Option
     # Read ARP cache again
     return _parse_arp_cache(mac_lower)
 
-def scan_network_for_device(mac_prefix: Optional[str] = None, 
-                           subnet: str = "192.168.168.0/24") -> List[Dict[str, str]]:
+
+def scan_network_for_device(
+    mac_prefix: Optional[str] = None, subnet: str = "192.168.168.0/24"
+) -> List[Dict[str, str]]:
     devices = []
-    
+
     try:
         network = ipaddress.ip_network(subnet, strict=False)
-        
+
         for ip in network.hosts():
             ip_str = str(ip)
             if port_open(ip_str, 80, timeout=0.5) or port_open(ip_str, 22, timeout=0.5):
@@ -276,8 +289,9 @@ def scan_network_for_device(mac_prefix: Optional[str] = None,
                 devices.append({"ip": ip_str, "reachable": True})
     except:
         pass
-    
+
     return devices
+
 
 def get_mac_address(ip: str) -> Optional[str]:
     """Return MAC for a given IP using ARP or `ip neigh`.
@@ -310,7 +324,9 @@ def get_mac_address(ip: str) -> Optional[str]:
     # Fallback: `ip neigh show to <ip>`
     try:
         if shutil.which("ip"):
-            result = subprocess.run(["ip", "neigh", "show", "to", ip], capture_output=True, text=True)
+            result = subprocess.run(
+                ["ip", "neigh", "show", "to", ip], capture_output=True, text=True
+            )
             m = re.search(r"lladdr\s+([0-9a-f:]{17})", result.stdout, re.IGNORECASE)
             if m:
                 return m.group(1)
@@ -319,15 +335,17 @@ def get_mac_address(ip: str) -> Optional[str]:
 
     return None
 
+
 def wait_for_host(host: str, port: int = 22, timeout: int = 60, interval: int = 2) -> bool:
     start_time = time.time()
-    
+
     while time.time() - start_time < timeout:
         if port_open(host, port, timeout=2):
             return True
         time.sleep(interval)
-    
+
     return False
+
 
 def get_interface_info() -> Dict[str, Dict[str, str]]:
     interfaces: Dict[str, Dict[str, str]] = {}
@@ -336,35 +354,35 @@ def get_interface_info() -> Dict[str, Dict[str, str]]:
         if shutil.which("ip"):
             result = subprocess.run(["ip", "addr", "show"], capture_output=True, text=True)
             current_iface = None
-            for line in result.stdout.split('\n'):
-                iface_match = re.match(r'^(\d+):\s+(\w+):', line)
+            for line in result.stdout.split("\n"):
+                iface_match = re.match(r"^(\d+):\s+(\w+):", line)
                 if iface_match:
                     current_iface = iface_match.group(2)
                     interfaces[current_iface] = {}
                 elif current_iface:
-                    ip_match = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+/\d+)', line)
+                    ip_match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+/\d+)", line)
                     if ip_match:
-                        interfaces[current_iface]['ip'] = ip_match.group(1)
-                    mac_match = re.search(r'link/ether\s+([0-9a-f:]{17})', line, re.IGNORECASE)
+                        interfaces[current_iface]["ip"] = ip_match.group(1)
+                    mac_match = re.search(r"link/ether\s+([0-9a-f:]{17})", line, re.IGNORECASE)
                     if mac_match:
-                        interfaces[current_iface]['mac'] = mac_match.group(1)
+                        interfaces[current_iface]["mac"] = mac_match.group(1)
         elif system == "Darwin" and shutil.which("ifconfig"):
             result = subprocess.run(["ifconfig"], capture_output=True, text=True)
             current_iface = None
-            for line in result.stdout.split('\n'):
-                m_iface = re.match(r'^(\w+):', line)
+            for line in result.stdout.split("\n"):
+                m_iface = re.match(r"^(\w+):", line)
                 if m_iface:
                     current_iface = m_iface.group(1)
                     interfaces[current_iface] = {}
                     continue
                 if current_iface:
-                    ip_match = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)', line)
+                    ip_match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", line)
                     if ip_match:
                         # Prefix length parsing omitted here; for display only
-                        interfaces[current_iface]['ip'] = ip_match.group(1)
-                    mac_match = re.search(r'ether\s+([0-9a-f:]{17})', line, re.IGNORECASE)
+                        interfaces[current_iface]["ip"] = ip_match.group(1)
+                    mac_match = re.search(r"ether\s+([0-9a-f:]{17})", line, re.IGNORECASE)
                     if mac_match:
-                        interfaces[current_iface]['mac'] = mac_match.group(1)
+                        interfaces[current_iface]["mac"] = mac_match.group(1)
     except Exception:
         pass
     return interfaces

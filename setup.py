@@ -34,6 +34,7 @@ setup(
         "cryptography>=41.0.0",
         "aiohttp>=3.8.0",
         "pydantic>=2.5.0",
+        "pymonocypher==3.1.3.2",
     ],
     extras_require={
         "dev": [

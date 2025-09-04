@@ -23,14 +23,18 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from ..config import RadioConfig, RadioRole, Config
 from .mh_profile import MHProfile, detect_profile
 from ..utils.network import (
-    port_open, discover_services, get_mac_address, 
-    find_mac_in_leases, wait_for_host
+    port_open,
+    discover_services,
+    get_mac_address,
+    find_mac_in_leases,
+    wait_for_host,
 )
 from ..utils.logging import get_logger, info, success, error, warning
 
 logger = get_logger(__name__)
 
 _SENSITIVE_KEYS = ("password", "pass", "key", "secret", "token", "ubus_rpc_session", "aes")
+
 
 def _mask_value(v: Any) -> Any:
     if isinstance(v, str):
@@ -40,6 +44,7 @@ def _mask_value(v: Any) -> Any:
             return "****"
         return v[:2] + "***" + v[-2:]
     return v
+
 
 def _mask_dict(obj: Any) -> Any:
     try:
@@ -57,6 +62,7 @@ def _mask_dict(obj: Any) -> Any:
         pass
     return obj
 
+
 def _mask_cmd(cmd: str) -> str:
     try:
         s = cmd.strip()
@@ -69,6 +75,23 @@ def _mask_cmd(cmd: str) -> str:
     except Exception:
         return cmd
 
+
+def _mask_at(cmd: str) -> str:
+    """Mask sensitive values in AT commands for logging."""
+    try:
+        s = cmd.strip()
+        up = s.upper()
+        # Handle MSPWD and similar password commands
+        if up.startswith("AT+MSPWD") or any(t in up for t in ["PWD", "PASS", "KEY", "AES"]):
+            if "=" in s:
+                left, _right = s.split("=", 1)
+                return left + "=******"
+            return s
+        return s
+    except Exception:
+        return cmd
+
+
 @dataclass
 class MicrohardConnection:
     ip: str
@@ -77,10 +100,14 @@ class MicrohardConnection:
     telnet_available: bool
     mac_address: Optional[str] = None
 
+
 class MicrohardDriver:
-    def __init__(self, ip: str = Config.DEFAULT_MICROHARD_IP, 
-                 username: str = Config.DEFAULT_MICROHARD_USER,
-                 password: str = Config.DEFAULT_MICROHARD_PASS):
+    def __init__(
+        self,
+        ip: str = Config.DEFAULT_MICROHARD_IP,
+        username: str = Config.DEFAULT_MICROHARD_USER,
+        password: str = Config.DEFAULT_MICROHARD_PASS,
+    ):
         self.ip = ip
         self.username = username
         self.password = password
@@ -94,7 +121,7 @@ class MicrohardDriver:
         # Cached HTTP session + base URL for ubus
         self._http_session: Optional[requests.Session] = None
         self._http_base_url: Optional[str] = None
-        
+
     # Choose https if 443 is open; otherwise http. Probe once and cache.
     def _http_base(self) -> str:
         if self._http_base_url:
@@ -127,7 +154,11 @@ class MicrohardDriver:
             res = j.get("result", []) if isinstance(j, dict) else []
             if len(res) > 1 and isinstance(res[1], dict):
                 values = res[1].get("values") or {}
-                candidates = [sid for sid, sec in values.items() if isinstance(sec, dict) and sec.get(".type") == type_]
+                candidates = [
+                    sid
+                    for sid, sec in values.items()
+                    if isinstance(sec, dict) and sec.get(".type") == type_
+                ]
                 if len(candidates) > index:
                     return candidates[index]
         except Exception:
@@ -177,47 +208,55 @@ class MicrohardDriver:
     def discover(self, timeout: float = 2.0) -> MicrohardConnection:
         logger.info(f"Discovering Microhard radio at {self.ip}")
         services = discover_services(self.ip, timeout)
-        
+
         if not any(services.values()):
             error(f"No services found at {self.ip}")
             error("Please power-cycle the radio and switch together, then try again")
             raise ConnectionError(f"Cannot reach Microhard radio at {self.ip}")
-        
+
         mac = get_mac_address(self.ip)
         if mac:
             self.original_mac = mac
             logger.debug(f"Radio MAC address: {mac}")
-        
+
         connection = MicrohardConnection(
             ip=self.ip,
-            ssh_available=services['ssh'],
-            http_available=services['http'],
-            telnet_available=services['telnet'],
-            mac_address=mac
+            ssh_available=services["ssh"],
+            http_available=services["http"],
+            telnet_available=services["telnet"],
+            mac_address=mac,
         )
         # Persist MAC for later discovery (health --radio-ip auto)
         try:
             if mac:
                 from pathlib import Path
+
                 path = Config.STATE_DIR / "last_radio_mac.txt"
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with open(path, 'w') as f:
+                with open(path, "w") as f:
                     f.write(mac.strip())
                 try:
                     import os
+
                     os.chmod(path, 0o600)
                 except Exception:
                     pass
         except Exception:
             pass
-        
-        info(f"Found services - SSH: {services['ssh']}, HTTP: {services['http']}, Telnet: {services['telnet']}")
+
+        info(
+            f"Found services - SSH: {services['ssh']}, HTTP: {services['http']}, Telnet: {services['telnet']}"
+        )
         return connection
-    
+
     def _ssh_execute(self, command: str, *, try_exec_first: bool = True) -> Tuple[bool, str]:
         try:
-            logger.debug(f"SSH connecting to {self.ip} as {self.username} with password: {'*' * len(self.password)}")
-            logger.debug(f"SSH credentials - user: '{self.username}', pass_len: {len(self.password)} (value masked)")
+            logger.debug(
+                f"SSH connecting to {self.ip} as {self.username} with password: {'*' * len(self.password)}"
+            )
+            logger.debug(
+                f"SSH credentials - user: '{self.username}', pass_len: {len(self.password)} (value masked)"
+            )
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(
@@ -257,14 +296,16 @@ class MicrohardDriver:
             logger.debug(f"SSH invoking shell for command: {_mask_cmd(command)}")
             channel = client.invoke_shell()
             channel.settimeout(5.0)
-            
+
             # Wait for initial prompt and detect if we're in CLI or shell
             time.sleep(0.2)
             initial_output = ""
             if channel.recv_ready():
-                initial_output = channel.recv(4096).decode('utf-8', errors='ignore')
-                logger.debug(f"Initial prompt: {initial_output[-50:]}")  # Log last 50 chars to see prompt
-            
+                initial_output = channel.recv(4096).decode("utf-8", errors="ignore")
+                logger.debug(
+                    f"Initial prompt: {initial_output[-50:]}"
+                )  # Log last 50 chars to see prompt
+
             # Check if we're in the Microhard CLI (UserDevice> prompt)
             if "UserDevice>" in initial_output or "ERROR: Invalid command" in initial_output:
                 logger.debug("Detected Microhard CLI, entering Linux shell")
@@ -273,30 +314,30 @@ class MicrohardDriver:
                     channel.send(f"{shell_cmd}\n")
                     time.sleep(0.2)
                     if channel.recv_ready():
-                        shell_output = channel.recv(4096).decode('utf-8', errors='ignore')
+                        shell_output = channel.recv(4096).decode("utf-8", errors="ignore")
                         if "#" in shell_output or "$" in shell_output or "~" in shell_output:
                             logger.debug(f"Successfully entered shell with '{shell_cmd}'")
                             break
                         elif "ERROR" not in shell_output:
                             # Might have worked but no prompt yet
                             break
-            
+
             # Now execute the actual command inside the shell
             channel.send(f"{command}\n")
             time.sleep(0.2)
-            
+
             # Collect output
             output = ""
             retries = 0
             while retries < 10:
                 if channel.recv_ready():
-                    chunk = channel.recv(4096).decode('utf-8', errors='ignore')
+                    chunk = channel.recv(4096).decode("utf-8", errors="ignore")
                     output += chunk
                     retries = 0  # Reset retries if we got data
                 else:
                     time.sleep(0.1)
                     retries += 1
-            
+
             # Clean up and close
             channel.send("exit\n")
             time.sleep(0.2)
@@ -304,28 +345,30 @@ class MicrohardDriver:
                 channel.send("exit\n")  # Exit CLI too
             channel.close()
             client.close()
-            
+
             # Clean output - remove command echo and prompts
-            lines = output.split('\n')
+            lines = output.split("\n")
             cleaned_lines = []
             for line in lines:
                 # Skip lines that are just the command echo or prompts
                 if line.strip() == command:
                     continue
-                if line.strip() in ['#', '$', 'UserDevice>', '']:
+                if line.strip() in ["#", "$", "UserDevice>", ""]:
                     continue
                 if "UserDevice>" in line and len(line.strip()) < 20:
                     continue
                 cleaned_lines.append(line)
-            
-            output = '\n'.join(cleaned_lines).strip()
-            
+
+            output = "\n".join(cleaned_lines).strip()
+
             logger.debug(f"SSH command completed, output length: {len(output)}")
             return True, output
-            
+
         except paramiko.AuthenticationException as e:
             logger.error(f"SSH authentication failed for {self.username}@{self.ip}: {e}")
-            logger.debug(f"Attempted credentials - username: {self.username}, password length: {len(self.password)}")
+            logger.debug(
+                f"Attempted credentials - username: {self.username}, password length: {len(self.password)}"
+            )
             logger.debug("Common issues:")
             logger.debug("  1. Check if password is correct (default: 'admin')")
             logger.debug("  2. Verify username is 'admin'")
@@ -383,7 +426,9 @@ class MicrohardDriver:
                 pass
             buf = ""
             end_by = time.time() + 5.0
-            while time.time() < end_by and "UserDevice>" not in buf and not ("#" in buf or "$" in buf):
+            while (
+                time.time() < end_by and "UserDevice>" not in buf and not ("#" in buf or "$" in buf)
+            ):
                 if chan.recv_ready():
                     chunk = chan.recv(4096).decode("utf-8", errors="ignore")
                     buf += chunk
@@ -521,7 +566,7 @@ class MicrohardDriver:
                     else:
                         # Small sleep to avoid busy loop
                         time.sleep(0.05)
-                
+
                 # If the channel is no longer active after sending AT&W, consider it a success
                 if cmd.strip().upper() == "AT&W" and not chan.active:
                     return True, buf
@@ -530,7 +575,7 @@ class MicrohardDriver:
 
             # Execute the sequence
             for cmd in commands:
-                info(f"AT: {cmd}")
+                info(f"AT: {_mask_at(cmd)}")
                 ok, resp = send_and_wait(cmd)
                 agg_out += resp
                 if not ok:
@@ -544,14 +589,14 @@ class MicrohardDriver:
                             info("Configuration saved (radio restarting)")
                             ok = True
                         else:
-                            warning(f"AT command failed or timed out: {cmd}")
+                            warning(f"AT command failed or timed out: {_mask_at(cmd)}")
                             try:
                                 chan.close()
                             finally:
                                 client.close()
                             return False, agg_out.strip()
                     else:
-                        warning(f"AT command failed or timed out: {cmd}")
+                        warning(f"AT command failed or timed out: {_mask_at(cmd)}")
                         try:
                             chan.close()
                         finally:
@@ -572,7 +617,9 @@ class MicrohardDriver:
             logger.error(f"SSH(AT) session error: {e}")
             return False, str(e)
 
-    async def _telnet_execute_at_session_async(self, commands: list[str], *, per_cmd_timeout: float = 5.0) -> Tuple[bool, str]:
+    async def _telnet_execute_at_session_async(
+        self, commands: list[str], *, per_cmd_timeout: float = 5.0
+    ) -> Tuple[bool, str]:
         """Async helper: run AT commands over Telnet using telnetlib3.
 
         - Opens a telnet connection on port 23.
@@ -587,7 +634,8 @@ class MicrohardDriver:
         buf_all = ""
         try:
             # Provoke prompt and perform login handshake until we see UserDevice>
-            writer.write("\r\n"); await writer.drain()
+            writer.write("\r\n")
+            await writer.drain()
             await asyncio.sleep(0.1)
             sent_user = False
             sent_pass = False
@@ -603,11 +651,13 @@ class MicrohardDriver:
                     buf_all += chunk
                     low = buf_all.lower()
                     if not sent_user and ("login:" in low or "username:" in low):
-                        writer.write(self.username + "\r\n"); await writer.drain()
+                        writer.write(self.username + "\r\n")
+                        await writer.drain()
                         sent_user = True
                         continue
                     if sent_user and not sent_pass and ("password:" in low):
-                        writer.write(self.password + "\r\n"); await writer.drain()
+                        writer.write(self.password + "\r\n")
+                        await writer.drain()
                         sent_pass = True
                         continue
                     if "login incorrect" in low:
@@ -615,13 +665,15 @@ class MicrohardDriver:
                     if "UserDevice>" in buf_all:
                         break
                 else:
-                    writer.write("\r\n"); await writer.drain()
+                    writer.write("\r\n")
+                    await writer.drain()
             else:
                 return False, buf_all
 
             async def send_wait_ok(cmd: str) -> Tuple[bool, str]:
                 local_buf = ""
-                writer.write(cmd + "\r\n"); await writer.drain()
+                writer.write(cmd + "\r\n")
+                await writer.drain()
                 deadline = asyncio.get_event_loop().time() + min(per_cmd_timeout, 3.0)
                 while asyncio.get_event_loop().time() < deadline:
                     try:
@@ -641,7 +693,7 @@ class MicrohardDriver:
                 return False, local_buf
 
             for cmd in commands:
-                info(f"AT(telnet): {cmd}")
+                info(f"AT(telnet): {_mask_at(cmd)}")
                 ok, out = await send_wait_ok(cmd)
                 buf_all += out
                 if not ok:
@@ -652,37 +704,44 @@ class MicrohardDriver:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
-    def _telnet_execute_at_session(self, commands: list[str], *, per_cmd_timeout: float = 5.0) -> Tuple[bool, str]:
+    def _telnet_execute_at_session(
+        self, commands: list[str], *, per_cmd_timeout: float = 5.0
+    ) -> Tuple[bool, str]:
         try:
-            return asyncio.run(self._telnet_execute_at_session_async(commands, per_cmd_timeout=per_cmd_timeout))
+            # Mask secrets in logs
+            for c in commands:
+                info(f"AT(telnet): {_mask_at(c)}")
+            return asyncio.run(
+                self._telnet_execute_at_session_async(commands, per_cmd_timeout=per_cmd_timeout)
+            )
         except Exception as e:
             logger.error(f"Telnet AT session error: {e}")
             return False, str(e)
 
-    def _build_at_commands_from_staged(self) -> list:
+    def _build_at_commands_from_staged(self, *, include_dhcp: bool = True) -> list:
         """Translate staged_config and semantic params into AT command list."""
         at_cmds: list[str] = []
         # System
         try:
-            hostname = self.staged_config.get('system', {}).get('@system[0]', {}).get('hostname')
+            hostname = self.staged_config.get("system", {}).get("@system[0]", {}).get("hostname")
             if hostname:
                 at_cmds.append(f"AT+MSMNAME={hostname}")
-            if self.staged_config.get('system', {}).get('@system[0]', {}).get('description'):
+            if self.staged_config.get("system", {}).get("@system[0]", {}).get("description"):
                 warning("System description is not supported via AT; skipping")
         except Exception:
             pass
         # Wireless
         if self._radio_params:
-            role = str(self._radio_params.get('role') or '').strip()
-            mode_val = 0 if role.lower() == 'master' else 1
+            role = str(self._radio_params.get("role") or "").strip()
+            mode_val = 0 if role.lower() == "master" else 1
             at_cmds.append(f"AT+MWVMODE={mode_val}")
             try:
-                freq = int(self._radio_params.get('freq_mhz'))
+                freq = int(self._radio_params.get("freq_mhz"))
                 at_cmds.append(f"AT+MWFREQ={freq}")
             except Exception:
                 warning("Invalid frequency in staged params; skipping")
             try:
-                bw = int(self._radio_params.get('bw_mhz'))
+                bw = int(self._radio_params.get("bw_mhz"))
                 bw_code_map = {5: 0, 10: 1, 20: 2, 40: 3}
                 bw_code = bw_code_map.get(bw, 0)
                 if bw_code == 0 and bw != 5:
@@ -690,34 +749,37 @@ class MicrohardDriver:
                 at_cmds.append(f"AT+MWBAND={bw_code}")
             except Exception:
                 warning("Invalid bandwidth in staged params; skipping")
-            net_id = self._radio_params.get('net_id')
+            net_id = self._radio_params.get("net_id")
             if net_id:
                 at_cmds.append(f"AT+MWNETWORKID={net_id}")
             # TX power using the correct command for this model
             try:
-                txp = int(self._radio_params.get('tx_power'))
+                txp = int(self._radio_params.get("tx_power"))
                 # Use AT+MWTXPOWERQ with save flag (1 = save permanently)
                 at_cmds.append(f"AT+MWTXPOWERQ={txp},1")
             except Exception:
                 warning("Invalid tx_power in staged params; skipping")
-            encrypt_enable = str(self._radio_params.get('encrypt_enable') or '0').strip()
-            aes_key = self._radio_params.get('aes_key')
-            if encrypt_enable == '1' and aes_key:
+            encrypt_enable = str(self._radio_params.get("encrypt_enable") or "0").strip()
+            aes_key = self._radio_params.get("aes_key")
+            if encrypt_enable == "1" and aes_key:
                 at_cmds.append(f"AT+MWVENCRYPT=1,{aes_key}")
             else:
                 at_cmds.append("AT+MWVENCRYPT=0")
         # Network
         try:
-            if self.staged_config.get('network', {}).get('lan', {}).get('proto') == 'dhcp':
+            if (
+                include_dhcp
+                and self.staged_config.get("network", {}).get("lan", {}).get("proto") == "dhcp"
+            ):
                 at_cmds.append("AT+MNIFACE=lan,EDIT,0")
         except Exception:
             pass
         # NOTE: Stats configuration removed - handled via UCI commands for granular control
-        
+
         # Save
         at_cmds.append("AT&W")
         return at_cmds
-    
+
     def _ubus_login(self) -> Optional[str]:
         """Authenticate to the device, preferring LuCI RPC then falling back to raw ubus.
 
@@ -776,7 +838,7 @@ class MicrohardDriver:
         except Exception as e:
             logger.error(f"ubus login failed: {e}")
         return None
-    
+
     def _ubus_call(self, service: str, method: str, params: Dict[str, Any]) -> Optional[Dict]:
         if not self.session_token:
             self.session_token = self._ubus_login()
@@ -806,7 +868,12 @@ class MicrohardDriver:
                     if "error" in j:
                         return None
                     res = j.get("result")
-                    if isinstance(res, list) and len(res) > 0 and isinstance(res[0], int) and res[0] != 0:
+                    if (
+                        isinstance(res, list)
+                        and len(res) > 0
+                        and isinstance(res[0], int)
+                        and res[0] != 0
+                    ):
                         return None
                 return j
             except Exception as e:
@@ -821,7 +888,7 @@ class MicrohardDriver:
         if not self.session_token:
             return None
         return do_call(self.session_token)
-    
+
     def _uci_add_http(self, config: str, type_: str) -> Optional[str]:
         """Add a dynamic section via ubus uci.add and return its section id (e.g., cfg0abc)."""
         j = self._ubus_call("uci", "add", {"config": config, "type": type_})
@@ -832,69 +899,73 @@ class MicrohardDriver:
         except Exception:
             pass
         return None
-    
+
     def _stage_system_config(self, config: RadioConfig):
-        self.staged_config['system'] = {
-            '@system[0]': {
-                'hostname': config.hostname,
-                'description': config.description
-            }
+        self.staged_config["system"] = {
+            "@system[0]": {"hostname": config.hostname, "description": config.description}
         }
         logger.debug(f"Staged system config: hostname={config.hostname}")
-    
+
     def _stage_radio_params(self, config: RadioConfig):
         # Stage semantic radio params; mapping to UCI happens during apply via profile
         encrypt_enable = "1" if str(config.encryption).lower().startswith("aes") else "0"
         self._radio_params = {
-            'role': config.mode,
-            'freq_mhz': int(config.frequency),
-            'bw_mhz': int(config.bandwidth),
-            'net_id': config.net_id,
-            'aes_key': config.aes_key,
-            'tx_power': int(config.tx_power),
-            'encrypt_enable': encrypt_enable,
+            "role": config.mode,
+            "freq_mhz": int(config.frequency),
+            "bw_mhz": int(config.bandwidth),
+            "net_id": config.net_id,
+            "aes_key": config.aes_key,
+            "tx_power": int(config.tx_power),
+            "encrypt_enable": encrypt_enable,
         }
         logger.debug(
             f"Staged radio params: role={config.mode}, freq={config.frequency}, bw={config.bandwidth}, net={config.net_id}, tx_power={config.tx_power}, encrypt={encrypt_enable}"
         )
-    
+
     def _stage_network_config(self, config: RadioConfig):
         if config.dhcp_client:
-            self.staged_config['network'] = {
-                'lan': {
-                    'proto': 'dhcp'
-                }
-            }
+            self.staged_config["network"] = {"lan": {"proto": "dhcp"}}
             logger.debug("Staged network config: DHCP client")
-    
+
     def _stage_radio_stats_config(self, config: RadioConfig):
         if config.radio_stats_enabled:
             self._stats_params = {
-                'enable': '1',
-                'port': str(config.radio_stats_port),
-                'interval': str(config.radio_stats_interval),
-                'fields': 'rf,rssi,snr,associated_ip',
+                "enable": "1",
+                "port": str(config.radio_stats_port),
+                "interval": str(config.radio_stats_interval),
+                "fields": "rf,rssi,snr,associated_ip",
             }
             logger.debug(f"Staged radio stats (semantic): port={config.radio_stats_port}")
-    
+
     def _freq_to_channel(self, freq: int) -> int:
         channel_map = {
-            2412: 1, 2417: 2, 2422: 3, 2427: 4, 2432: 5,
-            2437: 6, 2442: 7, 2447: 8, 2452: 9, 2457: 10,
-            2462: 11, 2467: 12, 2472: 13, 2484: 14
+            2412: 1,
+            2417: 2,
+            2422: 3,
+            2427: 4,
+            2432: 5,
+            2437: 6,
+            2442: 7,
+            2447: 8,
+            2452: 9,
+            2457: 10,
+            2462: 11,
+            2467: 12,
+            2472: 13,
+            2484: 14,
         }
         return channel_map.get(freq, 4)
-    
+
     def stage_config(self, config: RadioConfig):
         info(f"Staging configuration for {config.role.value} radio")
-        
+
         self.staged_config = {}
         self._stage_system_config(config)
         # Do NOT stage generic OpenWrt wireless fields; map via Microhard profile during apply
         self._stage_network_config(config)
         self._stage_radio_stats_config(config)
         self._stage_radio_params(config)
-        
+
         success(f"Configuration staged for {config.hostname}")
 
     def _detect_profile_via_ssh(self) -> Optional[MHProfile]:
@@ -930,7 +1001,9 @@ class MicrohardDriver:
 
         batch_cmds: list[str] = []
         if need_stats_section:
-            batch_cmds.append('uci -q show mh_stats | grep -q "@stats\\[0\\]" || uci add mh_stats stats')
+            batch_cmds.append(
+                'uci -q show mh_stats | grep -q "@stats\\[0\\]" || uci add mh_stats stats'
+            )
 
         touched_cfgs: set[str] = set()
         for (cfg, section), values in grouped.items():
@@ -980,12 +1053,14 @@ class MicrohardDriver:
         # Send one uci.set per section with all values
         for (cfg, section), values in grouped.items():
             logger.debug(f"HTTP applying mapped set {cfg}.{section} values={_mask_dict(values)}")
-            result = self._ubus_call("uci", "set", {"config": cfg, "section": section, "values": values})
+            result = self._ubus_call(
+                "uci", "set", {"config": cfg, "section": section, "values": values}
+            )
             if not result:
                 error(f"Failed to set {cfg}.{section} via HTTP")
                 return False
         return True
-    
+
     def _uci_has_config_ssh(self, cfg: str) -> bool:
         """Check if a UCI config file exists on the device."""
         ok, _ = self._ssh_execute(f"[ -f /etc/config/{shlex.quote(cfg)} ]")
@@ -1006,10 +1081,14 @@ class MicrohardDriver:
             # Prefer the LuCI-backed udpReport if present on this firmware
             if self._uci_has_config_ssh("udpReport"):
                 info("Detected udpReport config - using LuCI-compatible configuration")
-                enable = '1' if str(self._stats_params.get('enable', '1')) in ('1', 'true', 'on') else '0'
-                serverip = str(self._stats_params.get('server_ip') or self.ip)
-                port = str(self._stats_params.get('port') or 20200)
-                interval = str(self._stats_params.get('interval') or 60000)  # ms
+                enable = (
+                    "1"
+                    if str(self._stats_params.get("enable", "1")) in ("1", "true", "on")
+                    else "0"
+                )
+                serverip = str(self._stats_params.get("server_ip") or self.ip)
+                port = str(self._stats_params.get("port") or 20200)
+                interval = str(self._stats_params.get("interval") or 60000)  # ms
 
                 cmds = [
                     f"uci set udpReport.general.enable={shlex.quote(enable)}",
@@ -1032,40 +1111,40 @@ class MicrohardDriver:
 
             # Fall back to existing mh_stats flow
             info("Using mh_stats configuration (udpReport not found)")
-            enable = str(self._stats_params.get('enable') or '0')
+            enable = str(self._stats_params.get("enable") or "0")
             ok, out = self._ssh_execute(f"uci set mh_stats.@stats[0].enable={enable}")
             if not ok:
                 error(f"Failed to set stats enable: {out}")
                 return False
-            
-            if enable == '1':
+
+            if enable == "1":
                 # Set port
-                port = str(self._stats_params.get('port') or 22222)
+                port = str(self._stats_params.get("port") or 22222)
                 ok, out = self._ssh_execute(f"uci set mh_stats.@stats[0].port={port}")
                 if not ok:
                     error(f"Failed to set stats port: {out}")
                     return False
-                
+
                 # Set interval
-                interval = str(self._stats_params.get('interval') or 1000)
+                interval = str(self._stats_params.get("interval") or 1000)
                 ok, out = self._ssh_execute(f"uci set mh_stats.@stats[0].interval={interval}")
                 if not ok:
                     error(f"Failed to set stats interval: {out}")
                     return False
-                
+
                 # Set fields (including associated_ip)
-                fields = self._stats_params.get('fields', 'rf,rssi,snr,associated_ip')
+                fields = self._stats_params.get("fields", "rf,rssi,snr,associated_ip")
                 ok, out = self._ssh_execute(f"uci set mh_stats.@stats[0].fields='{fields}'")
                 if not ok:
                     error(f"Failed to set stats fields: {out}")
                     return False
-                
+
                 # Set server IP (using radio's own IP as placeholder)
                 ok, out = self._ssh_execute(f"uci set mh_stats.@stats[0].server_ip={self.ip}")
                 if not ok:
                     error(f"Failed to set stats server IP: {out}")
                     return False
-            
+
             # Commit the changes
             cmds2 = [
                 "uci commit mh_stats",
@@ -1075,19 +1154,23 @@ class MicrohardDriver:
             if not ok2:
                 error("Failed to commit/restart mh_stats via batch")
                 return False
-            
+
             return True
-            
+
         except Exception as e:
             error(f"Failed to apply stats via UCI: {e}")
             return False
 
     def apply_via_ssh(self) -> bool:
         info("Applying configuration via hybrid SSH (AT+UCI)")
-        logger.debug(f"Using SSH credentials - username: {self.username}, password: {'*' * len(self.password)}")
+        logger.debug(
+            f"Using SSH credentials - username: {self.username}, password: {'*' * len(self.password)}"
+        )
 
         # Step 1: Apply fundamental settings via AT commands
-        at_cmds = self._build_at_commands_from_staged()
+        # If we still need to push stats via UCI, delay DHCP flip until after stats.
+        include_dhcp = not bool(self._stats_params)
+        at_cmds = self._build_at_commands_from_staged(include_dhcp=include_dhcp)
         ok, out = self._ssh_execute_at_session(at_cmds)
         if not ok:
             error(f"AT command portion failed: {out[-200:] if out else out}")
@@ -1100,51 +1183,76 @@ class MicrohardDriver:
             info("Waiting for radio to restart after configuration save...")
             max_wait = 60
             start_time = time.time()
+            ready = False
             while time.time() - start_time < max_wait:
                 if port_open(self.ip, 22, timeout=0.5):
-                    success(f"Radio SSH is back ({int(time.time() - start_time)}s)")
-                    break
+                    # Verify we can actually exec a no-op (ubus/uci stack tends to lag)
+                    ok_probe, _ = self._ssh_execute("true")
+                    if ok_probe:
+                        success(f"Radio SSH ready ({int(time.time() - start_time)}s)")
+                        ready = True
+                        break
                 time.sleep(0.25)
-            else:
-                warning("Radio not reachable after restart; continuing best-effort")
-            
+            if not ready:
+                warning("Radio not fully ready after restart; continuing best-effort")
+
             info("Applying radio stats configuration via UCI over SSH")
-            
+
             # Apply stats settings via UCI with retry logic
             max_retries = 3
             for attempt in range(max_retries):
                 try:
                     if self._apply_stats_via_uci_ssh():
                         success("Radio stats configuration applied and committed")
+                        # If we delayed DHCP earlier, switch LAN to DHCP now via UCI
+                        try:
+                            if (
+                                include_dhcp is False
+                                and self.staged_config.get("network", {})
+                                .get("lan", {})
+                                .get("proto")
+                                == "dhcp"
+                            ):
+                                info("Switching LAN to DHCP via UCI")
+                                self._run_uci_batch_ssh(
+                                    [
+                                        "uci set network.lan.proto=dhcp",
+                                        "uci commit network",
+                                    ]
+                                )
+                        except Exception:
+                            pass
                         return True
                 except Exception as e:
                     if attempt < max_retries - 1:
                         warning(f"UCI config attempt {attempt + 1} failed: {e}, retrying...")
                         time.sleep(3)
                     else:
-                        error(f"Failed to apply radio stats via UCI after {max_retries} attempts: {e}")
+                        error(
+                            f"Failed to apply radio stats via UCI after {max_retries} attempts: {e}"
+                        )
                         return False
-            
+
             error("Failed to apply radio stats via UCI over SSH")
             return False
 
         return True
-    
+
     def apply_via_http(self) -> bool:
         info("Applying configuration via HTTP/ubus")
-        
+
         if not self.session_token:
             self.session_token = self._ubus_login()
             if not self.session_token:
                 error("Failed to authenticate with radio")
                 return False
-        
+
         # Apply staged generic configs (system/network)
         for config_type, sections in self.staged_config.items():
             for section, values in sections.items():
                 # Resolve dynamic selectors like @system[0] to concrete section ids
                 orig_section = section
-                if isinstance(section, str) and section.startswith('@'):
+                if isinstance(section, str) and section.startswith("@"):
                     m = re.match(r"@([A-Za-z0-9_]+)\[(\d+)\]", section)
                     if m:
                         type_ = m.group(1)
@@ -1155,35 +1263,39 @@ class MicrohardDriver:
                             if new_sid:
                                 resolved = new_sid
                         section = resolved or section
-                logger.debug(f"HTTP set {config_type}.{section} values={_mask_dict(values)} (from {orig_section})")
-                result = self._ubus_call("uci", "set", {
-                    "config": config_type,
-                    "section": section,
-                    "values": values
-                })
-                
+                logger.debug(
+                    f"HTTP set {config_type}.{section} values={_mask_dict(values)} (from {orig_section})"
+                )
+                result = self._ubus_call(
+                    "uci", "set", {"config": config_type, "section": section, "values": values}
+                )
+
                 if not result:
                     error(f"Failed to set {config_type}.{section}")
                     return False
         # Apply radio params and stats via profile mapping
         if self._radio_params:
-            if not self._apply_profile_sets_http({
-                'role': self._radio_params.get('role'),
-                'freq_mhz': self._radio_params.get('freq_mhz'),
-                'bw_mhz': self._radio_params.get('bw_mhz'),
-                'net_id': self._radio_params.get('net_id'),
-                'aes_key': self._radio_params.get('aes_key'),
-                'tx_power': self._radio_params.get('tx_power'),
-                'encrypt_enable': self._radio_params.get('encrypt_enable'),
-            }):
+            if not self._apply_profile_sets_http(
+                {
+                    "role": self._radio_params.get("role"),
+                    "freq_mhz": self._radio_params.get("freq_mhz"),
+                    "bw_mhz": self._radio_params.get("bw_mhz"),
+                    "net_id": self._radio_params.get("net_id"),
+                    "aes_key": self._radio_params.get("aes_key"),
+                    "tx_power": self._radio_params.get("tx_power"),
+                    "encrypt_enable": self._radio_params.get("encrypt_enable"),
+                }
+            ):
                 return False
         if self._stats_params:
-            if not self._apply_profile_sets_http({
-                'stats_enable': self._stats_params.get('enable'),
-                'stats_port': self._stats_params.get('port'),
-                'stats_interval': self._stats_params.get('interval'),
-                'stats_fields': self._stats_params.get('fields'),
-            }):
+            if not self._apply_profile_sets_http(
+                {
+                    "stats_enable": self._stats_params.get("enable"),
+                    "stats_port": self._stats_params.get("port"),
+                    "stats_interval": self._stats_params.get("interval"),
+                    "stats_fields": self._stats_params.get("fields"),
+                }
+            ):
                 return False
 
         # Commit each affected config once
@@ -1196,18 +1308,18 @@ class MicrohardDriver:
             if not result:
                 error(f"Failed to commit {cfg}")
                 return False
-        
+
         success("Configuration committed via HTTP")
         return True
-    
+
     def apply_config(self, prefer_ssh: bool = True) -> bool:
         if not self.staged_config:
             warning("No configuration staged")
             return False
-        
+
         logger.debug("Beginning apply_config; discovering connection methods")
         connection = self.discover()
-        
+
         if prefer_ssh and connection.ssh_available:
             result = self.apply_via_ssh()
             if not result and connection.http_available:
@@ -1233,16 +1345,16 @@ class MicrohardDriver:
         else:
             error("No suitable connection method available")
             return False
-        
+
         if result:
             info("Configuration applied successfully")
             self.staged_config = {}
             # Clear staged semantic once applied
             self._radio_params = {}
             self._stats_params = {}
-        
+
         return result
-    
+
     def reboot(self) -> bool:
         info("Rebooting radio via AT command")
 
@@ -1264,7 +1376,7 @@ class MicrohardDriver:
         # Fallback to Telnet AT session
         if connection.telnet_available:
             try:
-                ok, out = self._telnet_execute_at_session(["AT+MSREB"]) 
+                ok, out = self._telnet_execute_at_session(["AT+MSREB"])
                 if ok:
                     success("Reboot command acknowledged via Telnet AT")
                     return True
@@ -1275,14 +1387,14 @@ class MicrohardDriver:
 
         error("Failed to send reboot command via available methods")
         return False
-    
+
     def wait_for_dhcp_flip(self, timeout: int = 120) -> Optional[str]:
         if not self.original_mac:
             warning("No original MAC address recorded")
             return None
-        
+
         info(f"Waiting for radio to get DHCP address (MAC: {self.original_mac})")
-        
+
         start_time = time.time()
         while time.time() - start_time < timeout:
             # Try to warm ARP on the current /24 at least before reading
@@ -1295,18 +1407,18 @@ class MicrohardDriver:
                 self.session_token = None
                 return new_ip
             time.sleep(2)
-        
+
         warning("Timeout waiting for DHCP flip")
         return None
-    
+
     def safe_reset(self) -> bool:
         info("Performing safe reset via AT commands")
-        
+
         connection = self.discover()
         if not connection.telnet_available:
             error("Telnet not available for safe reset")
             return False
-        
+
         async def _do_telnet_reset(host: str, username: str, password: str) -> None:
             reader, writer = await asyncio.wait_for(
                 telnetlib3.open_connection(host, 23, encoding="utf8"),
@@ -1315,15 +1427,29 @@ class MicrohardDriver:
             try:
                 # Telnet may expose either Microhard CLI or require login first
                 info(f"Telnet: session opened to {host}:23; detecting prompt type")
-                
+
                 # Try to reach the CLI prompt with basic auth handshake
-                writer.write("\r\n"); await writer.drain()
+                writer.write("\r\n")
+                await writer.drain()
                 await asyncio.sleep(0.1)
                 buf = ""
                 sent_user = False
                 sent_pass = False
                 end_by = asyncio.get_event_loop().time() + 8.0
                 while asyncio.get_event_loop().time() < end_by:
+                    # Fast-path: try readuntil known prompt if supported by reader
+                    try:
+                        got = await asyncio.wait_for(
+                            reader.readuntil("UserDevice>"), timeout=0.05
+                        )
+                        if (
+                            isinstance(got, (bytes, bytearray))
+                            and b"UserDevice>" in got
+                        ) or (isinstance(got, str) and "UserDevice>" in got):
+                            info("Telnet: Microhard CLI prompt detected")
+                            break
+                    except Exception:
+                        pass
                     try:
                         chunk = await asyncio.wait_for(reader.read(1024), timeout=0.2)
                     except asyncio.TimeoutError:
@@ -1335,11 +1461,13 @@ class MicrohardDriver:
                         low = buf.lower()
                         if not sent_user and ("login:" in low or "username:" in low):
                             info("Telnet: Login prompt detected, authenticating")
-                            writer.write(username + "\r\n"); await writer.drain()
+                            writer.write(username + "\r\n")
+                            await writer.drain()
                             sent_user = True
                             continue
                         if sent_user and not sent_pass and ("password:" in low):
-                            writer.write(password + "\r\n"); await writer.drain()
+                            writer.write(password + "\r\n")
+                            await writer.drain()
                             sent_pass = True
                             # continue reading until prompt
                             continue
@@ -1350,14 +1478,16 @@ class MicrohardDriver:
                             break
                     else:
                         # Nudge prompt
-                        writer.write("\r\n"); await writer.drain()
+                        writer.write("\r\n")
+                        await writer.drain()
                 else:
                     # Timed out waiting for CLI prompt
                     raise RuntimeError("No CLI prompt on Telnet after auth")
 
                 async def send_and_wait_ok(cmd: str, timeout: float = 5.0) -> bool:
-                    info(f"Telnet: sending {cmd}")
-                    writer.write(cmd + "\r\n"); await writer.drain()
+                    info(f"Telnet: sending {_mask_at(cmd)}")
+                    writer.write(cmd + "\r\n")
+                    await writer.drain()
                     # Read until OK or ERROR
                     end_by = asyncio.get_event_loop().time() + min(timeout, 3.0)
                     buf = ""
@@ -1376,10 +1506,10 @@ class MicrohardDriver:
                                 warning("Telnet: login failed during command")
                                 return False
                             if "OK" in buf:
-                                info(f"Telnet: OK received for {cmd}")
+                                info(f"Telnet: OK received for {_mask_at(cmd)}")
                                 return True
                             if "ERROR" in buf:
-                                warning(f"Telnet: ERROR received for {cmd}")
+                                warning(f"Telnet: ERROR received for {_mask_at(cmd)}")
                                 return False
                     tail = buf[-120:] if buf else ""
                     warning(f"Telnet: timeout waiting for OK after {cmd}; tail='{tail}'")
@@ -1387,8 +1517,13 @@ class MicrohardDriver:
 
                 async def send_and_confirm(cmd: str, timeout: float = 5.0) -> bool:
                     """Send command and handle confirmation prompts."""
-                    info(f"Telnet: sending {cmd}")
-                    writer.write(cmd + "\r\n"); await writer.drain()
+                    info(f"Telnet: sending {_mask_at(cmd)}")
+                    writer.write(cmd + "\r\n")
+                    await writer.drain()
+                    # Some firmware expects immediate confirmation for MSRTF
+                    if cmd.strip().upper() == "AT+MSRTF=0":
+                        writer.write("AT+MSRTF=1\r\n")
+                        await writer.drain()
                     # Read response
                     end_by = asyncio.get_event_loop().time() + min(timeout, 5.0)
                     buf = ""
@@ -1402,21 +1537,22 @@ class MicrohardDriver:
                                 chunk = chunk.decode("utf-8", errors="ignore")
                             buf += chunk
                             logger.debug(f"Response buffer: {buf[-200:]}")
-                            
+
                             # Check for confirmation prompts
                             if "Please confirm action" in buf or "confirm" in buf.lower():
                                 info("Telnet: Confirmation requested, sending AT+MSRTF=1")
-                                writer.write("AT+MSRTF=1\r\n"); await writer.drain()
+                                writer.write("AT+MSRTF=1\r\n")
+                                await writer.drain()
                                 # Clear buffer to avoid re-triggering confirmation
                                 buf = ""
                                 # Continue reading for OK
                                 continue
-                            
+
                             if "OK" in buf:
-                                info(f"Telnet: OK received for {cmd}")
+                                info(f"Telnet: OK received for {_mask_at(cmd)}")
                                 return True
                             if "ERROR" in buf:
-                                warning(f"Telnet: ERROR received for {cmd}")
+                                warning(f"Telnet: ERROR received for {_mask_at(cmd)}")
                                 return False
                     warning(f"Telnet: timeout for {cmd}")
                     return False
@@ -1430,7 +1566,7 @@ class MicrohardDriver:
                     # Try alternative reset commands
                     warning("AT+MSRTF failed, trying alternatives")
                     for cmd in ["AT+MSRT", "AT&F"]:
-                        info(f"Telnet: attempting {cmd}")
+                        info(f"Telnet: attempting {_mask_at(cmd)}")
                         ok = await send_and_wait_ok(cmd)
                         if ok:
                             info(f"Telnet: reset acknowledged using {cmd}")
@@ -1451,7 +1587,7 @@ class MicrohardDriver:
             logger.exception("Safe reset failed during Telnet interaction")
             error(f"Safe reset failed: {e!r}")
             return False
-    
+
     def change_password(self, new_password: str) -> bool:
         """Change the device password using the Microhard AT CLI over SSH.
 
@@ -1478,7 +1614,7 @@ class MicrohardDriver:
             connection = self.discover()
         except Exception:
             connection = MicrohardConnection(self.ip, False, False, False)
-        if getattr(connection, 'telnet_available', False):
+        if getattr(connection, "telnet_available", False):
             warning("SSH failed; attempting password change via Telnet AT")
             ok2, out2 = self._telnet_execute_at_session(cmds)
             if ok2:
@@ -1490,21 +1626,24 @@ class MicrohardDriver:
         error("Password change failed via AT CLI")
         # Prefer Telnet error output if available
         tail = ""
-        if 'out2' in locals() and out2:
+        if "out2" in locals() and out2:
             tail = out2[-200:]
         elif out:
             tail = out[-200:]
         if tail:
             logger.debug(f"AT password change output: {tail}")
         return False
-    
+
     def provision(self, config: RadioConfig) -> bool:
         try:
             connection = self.discover()
             info(f"Provisioning {config.role.value} radio: {config.hostname}")
-            
+
             # If we're using factory default password, change it to target password
-            if self.password == Config.DEFAULT_MICROHARD_PASS and Config.TARGET_MICROHARD_PASS != Config.DEFAULT_MICROHARD_PASS:
+            if (
+                self.password == Config.DEFAULT_MICROHARD_PASS
+                and Config.TARGET_MICROHARD_PASS != Config.DEFAULT_MICROHARD_PASS
+            ):
                 info("Detected factory default password, changing to deployment password")
                 old_password = self.password
                 if self.change_password(Config.TARGET_MICROHARD_PASS):
@@ -1523,28 +1662,28 @@ class MicrohardDriver:
                         return False
                 else:
                     warning("Could not change password, continuing with factory default")
-            
+
             self.stage_config(config)
-            
+
             if not self.apply_config():
                 error("Failed to apply configuration")
                 return False
-            
+
             if not self.reboot():
                 warning("Reboot command may have failed")
-            
+
             time.sleep(12)
-            
+
             if config.dhcp_client:
                 new_ip = self.wait_for_dhcp_flip()
                 if new_ip:
                     info(f"Radio accessible at new IP: {new_ip}")
                 else:
                     warning("Could not determine new IP address")
-            
+
             success(f"Radio {config.hostname} provisioned successfully")
             return True
-            
+
         except Exception as e:
             error(f"Provisioning failed: {e}")
             return False

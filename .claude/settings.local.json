@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source:*)",
+      "Bash(elijahctl:*)",
+      "Bash(python:*)",
+      "Bash(ping:*)",
+      "Bash(grep:*)",
+      "Bash(. venv/bin/activate)",
+      "Bash(if [ -f .venv/bin/activate ])",
+      "Bash(then)",
+      "Bash(. .venv/bin/activate)",
+      "Bash(else)",
+      "Bash(pip install:*)",
+      "Bash(fi)",
+      "Bash(__NEW_LINE__ python -c \"\nfrom elijahctl.drivers.microhard import MicrohardDriver\n\n# Create driver instance\ndriver = MicrohardDriver(''192.168.168.172'')\n\n# Test the new helper methods exist\nprint(''Testing new methods:'')\nprint(f''  _uci_has_config_ssh: {hasattr(driver, \"\"_uci_has_config_ssh\"\")}'')\nprint(f''  _restart_stats_daemon_ssh: {hasattr(driver, \"\"_restart_stats_daemon_ssh\"\")}'')\n\n# Check the updated _apply_stats_via_uci_ssh method\nimport inspect\nsource = inspect.getsource(driver._apply_stats_via_uci_ssh)\nprint(f''\\n_apply_stats_via_uci_ssh includes udpReport check: {\"\"udpReport\"\" in source}'')\nprint(f''_apply_stats_via_uci_ssh includes itemEPIP: {\"\"itemEPIP\"\" in source}'')\nprint(f''_apply_stats_via_uci_ssh includes Associated IP comment: {\"\"Associated IP\"\" in source}'')\n\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
